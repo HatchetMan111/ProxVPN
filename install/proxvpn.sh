@@ -16,6 +16,7 @@
 #
 # Optional env overrides:
 #   CT_ID=125 CORES=2 RAM=1024 DISK=4 BRIDGE=vmbr0 VLAN=10 bash -c "$(wget -qLO - ...)"
+#   REINSTALL=1 bash -c "$(wget -qLO - ...)"   # remove existing proxvpn CT and rebuild
 
 set -euo pipefail
 
@@ -36,6 +37,7 @@ BRIDGE="${BRIDGE:-vmbr0}"
 VLAN="${VLAN:-}"
 TAGS="${TAGS:-proxvpn;vpn}"
 ROOTFS_STORAGE="${ROOTFS_STORAGE:-auto}"   # "auto" = first lvm/lvmthin storage, fallback local-lvm
+REINSTALL="${REINSTALL:-0}"    # 1 = destroy existing proxvpn CT and rebuild
 
 # ----------------------- HELPERS -----------------------
 YW=$(echo "\033[33m"); RD=$(echo "\033[01;31m"); GN=$(echo "\033[1;92m"); CL=$(echo "\033[m")
@@ -87,10 +89,21 @@ elif pct status "$CT_ID" >/dev/null 2>&1; then
   exit 1
 fi
 
-# Idempotency: refuse to run twice for an existing container of the same name
-if pct list 2>/dev/null | awk 'NR>1 {print $NF}' | grep -qx "$CT_NAME"; then
-  msg_error "A container named '$CT_NAME' already exists. Uninstall it first (see README)."
-  exit 1
+# ----------------------- EXISTING CONTAINER -----------------------
+# Idempotency: a container with this name may already exist from a previous run.
+EXISTING_CT_ID=$(pct list 2>/dev/null | awk -v name="$CT_NAME" 'NR>1 && $NF==name {print $1; exit}')
+if [[ -n "$EXISTING_CT_ID" ]]; then
+  if [[ "$REINSTALL" == "1" ]]; then
+    msg_info "REINSTALL=1: removing existing CT ${EXISTING_CT_ID} (${CT_NAME})"
+    pct stop "$EXISTING_CT_ID" >/dev/null 2>&1 || true
+    pct destroy "$EXISTING_CT_ID" --purge >/dev/null
+    msg_ok "Old container removed"
+  else
+    msg_error "A container named '${CT_NAME}' already exists (CT ${EXISTING_CT_ID})."
+    msg_info "Reuse it (see README 'Update') or rerun with REINSTALL=1 to remove and rebuild it:"
+    msg_info "  REINSTALL=1 bash -c \"\$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/ProxVPN/main/install/${APP}.sh)\""
+    exit 1
+  fi
 fi
 
 # ----------------------- STORAGE -----------------------
