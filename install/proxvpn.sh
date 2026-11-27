@@ -35,7 +35,7 @@ DISK="${DISK:-4}"              # GiB
 BRIDGE="${BRIDGE:-vmbr0}"
 VLAN="${VLAN:-}"
 TAGS="${TAGS:-proxvpn;vpn}"
-ROOTFS_STORAGE="${ROOTFS_STORAGE:-auto}"   # "auto" = first lvm-thin storage, fallback local-lvm
+ROOTFS_STORAGE="${ROOTFS_STORAGE:-auto}"   # "auto" = first lvm/lvmthin storage, fallback local-lvm
 
 # ----------------------- HELPERS -----------------------
 YW=$(echo "\033[33m"); RD=$(echo "\033[01;31m"); GN=$(echo "\033[1;92m"); CL=$(echo "\033[m")
@@ -102,12 +102,12 @@ for s in json.load(sys.stdin):
     if "template" in s.get("content", []): print(s["storage"]); break' 2>/dev/null || true)
 [[ -n "$TEMPLATE_STORAGE" ]] || TEMPLATE_STORAGE="local"
 
-# rootfs storage: first lvm-thin, else local-lvm
+# rootfs storage: first lvmthin or lvm storage, else local-lvm
 if [[ "$ROOTFS_STORAGE" == "auto" ]]; then
   ROOTFS_STORAGE=$(pvesh get /storage --output-format json 2>/dev/null \
     | python3 -c 'import json,sys
 for s in json.load(sys.stdin):
-    if s.get("type") == "lvmthin": print(s["storage"]); break' 2>/dev/null || true)
+    if s.get("type") in ("lvmthin", "lvm") and "rootdir" in s.get("content", []): print(s["storage"]); break' 2>/dev/null || true)
   [[ -n "$ROOTFS_STORAGE" ]] || ROOTFS_STORAGE="local-lvm"
 fi
 msg_ok "Storages: templates=${TEMPLATE_STORAGE}, rootfs=${ROOTFS_STORAGE}"
@@ -133,10 +133,13 @@ msg_ok "Template ready (${TEMPLATE_STORAGE}/${TEMPLATE})"
 msg_info "Creating LXC ${CT_ID} (${CORES} vCPU, ${RAM} MiB RAM, ${DISK} GiB disk)"
 NET_STRING="name=eth0,bridge=${BRIDGE},ip=dhcp"
 [[ -n "$VLAN" ]] && NET_STRING="${NET_STRING},tag=${VLAN}"
+# NOTE: 'STORAGE:SIZE' lets pct create a fresh volume (e.g. vm-<id>-disk-0).
+# 'STORAGE:rootfs,size=...' would reference a non-existent existing volume
+# on lvm/lvmthin storages ("no such logical volume pve/rootfs").
 pct create "$CT_ID" "${TEMPLATE_STORAGE}:vztmpl/${TEMPLATE}" \
   --hostname "$CT_NAME" \
   --cores "$CORES" --memory "$RAM" --swap 512 \
-  --rootfs "${ROOTFS_STORAGE}:rootfs,size=${DISK}" \
+  --rootfs "${ROOTFS_STORAGE}:${DISK}" \
   --net0 "$NET_STRING" \
   --unprivileged 1 --features nesting=1 \
   --onboot 1 --start 1 \
