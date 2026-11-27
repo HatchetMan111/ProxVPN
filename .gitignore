@@ -1,0 +1,12 @@
+# Node / Vite
+node_modules/
+dist/
+
+# Python
+__pycache__/
+*.pyc
+venv/
+
+# Built frontend inside backend (created at install time)
+app/backend/static/assets/
+app/backend/static/index.html
