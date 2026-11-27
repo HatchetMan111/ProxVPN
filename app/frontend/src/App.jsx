@@ -41,6 +41,30 @@ function Chip({ label, value, tone }) {
   )
 }
 
+function Toggle({ checked, onChange, label, hint }) {
+  return (
+    <label className="toggle-row">
+      <span className="toggle">
+        <input type="checkbox" checked={checked} onChange={(e) => onChange(e.target.checked)} />
+        <span className="knob" />
+      </span>
+      <span className="toggle-text">
+        <strong>{label}</strong>
+        {hint && <em>{hint}</em>}
+      </span>
+    </label>
+  )
+}
+
+function fmtBytes(n) {
+  if (!n || n <= 0) return '0 B'
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB']
+  let i = 0
+  let v = n
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++ }
+  return `${v.toFixed(v >= 100 || i === 0 ? 0 : 1)} ${units[i]}`
+}
+
 function Toasts({ items }) {
   return (
     <div className="toasts" aria-live="polite">
@@ -119,6 +143,11 @@ export default function App() {
   const [toasts, setToasts] = useState([])
   const toastId = useRef(0)
 
+  const [settings, setSettings] = useState(null) // editable draft
+  const [savedSettings, setSavedSettings] = useState(null) // server state
+  const [stats, setStats] = useState(null)
+  const [dnsTest, setDnsTest] = useState(null)
+
   const toast = useCallback((msg, type = 'ok') => {
     const id = ++toastSeq.current
     setToasts((t) => [...t, { id, msg, type }])
@@ -129,6 +158,21 @@ export default function App() {
     try {
       setStatus(await api('status'))
       setError(null)
+    } catch (e) {
+      setError(e)
+    }
+    try {
+      setStats(await api('stats'))
+    } catch {
+      /* stats are optional */
+    }
+  }, [])
+
+  const loadSettings = useCallback(async () => {
+    try {
+      const s = await api('settings')
+      setSavedSettings(s)
+      setSettings({ ...s, _dns: (s.dns_servers || []).join(', ') })
     } catch (e) {
       setError(e)
     }
@@ -143,9 +187,10 @@ export default function App() {
   useEffect(() => {
     if (auth !== false) return
     refresh()
+    loadSettings()
     const t = setInterval(refresh, 5000)
     return () => clearInterval(t)
-  }, [auth, refresh])
+  }, [auth, refresh, loadSettings])
 
   const action = async (name, label) => {
     setBusy(name)
@@ -195,6 +240,48 @@ export default function App() {
     }
   }
 
+  const saveSettings = async () => {
+    setBusy('settings')
+    setError(null)
+    try {
+      const dns = (settings._dns || '').split(',').map((x) => x.trim()).filter(Boolean)
+      const r = await api('settings', {
+        method: 'POST',
+        body: JSON.stringify({
+          killswitch: !!settings.killswitch,
+          watchdog: !!settings.watchdog,
+          dns_servers: dns,
+          allow_cidr: settings.allow_cidr || '',
+        }),
+      })
+      setSavedSettings(r.settings)
+      setSettings({ ...r.settings, _dns: (r.settings.dns_servers || []).join(', ') })
+      setStatus((s) => ({ ...s, ...r, settings: undefined }))
+      toast('Einstellungen übernommen – Firewall neu aufgebaut')
+      await refresh()
+    } catch (e) {
+      setError(e)
+      toast('Einstellungen abgelehnt: ' + (typeof e.detail === 'string' ? e.detail : 'API-Fehler'), 'bad')
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  const runDnsTest = async () => {
+    setBusy('dnstest')
+    setDnsTest(null)
+    try {
+      const r = await api('dnstest', { method: 'POST' })
+      setDnsTest(r.results)
+      const allOk = r.results.length > 0 && r.results.every((x) => x.ok)
+      toast(allOk ? 'Alle DNS-Server erreichbar' : 'Nicht alle DNS-Server erreichbar', allOk ? 'ok' : 'warn')
+    } catch {
+      toast('DNS-Test fehlgeschlagen', 'bad')
+    } finally {
+      setBusy(null)
+    }
+  }
+
   const loadLogs = async () => {
     setBusy('logs')
     try {
@@ -225,6 +312,13 @@ export default function App() {
   const authOn = status?.auth_enabled || auth === true
   const pub = test?.public
   const unconfigured = status?.configured === false
+  const dirty = settings && savedSettings && (
+    settings.killswitch !== savedSettings.killswitch ||
+    settings.watchdog !== savedSettings.watchdog ||
+    (settings._dns || '') !== (savedSettings.dns_servers || []).join(', ') ||
+    (settings.allow_cidr || '') !== (savedSettings.allow_cidr || '')
+  )
+  const counters = stats?.counters || {}
 
   return (
     <div className="wrap">
@@ -238,7 +332,7 @@ export default function App() {
         </div>
         <div className="bar-right">
           <span className={'badge ' + (kill ? 'ok' : 'bad')}>
-            Kill Switch {kill === undefined ? '…' : kill ? 'aktiv' : 'inaktiv'}
+            Kill Switch {kill === undefined ? '…' : kill ? 'aktiv' : 'AUS'}
           </span>
           {authOn && (
             <button className="btn ghost" onClick={logout}>Abmelden</button>
@@ -266,7 +360,9 @@ export default function App() {
                   ? 'Noch keine ProtonVPN-Config hinterlegt – unten einfügen.'
                   : up
                     ? 'Traffic läuft durch den Tunnel.'
-                    : 'Kill Switch blockiert weitergeleiteten Traffic.'}
+                    : kill
+                      ? 'Kill Switch blockiert weitergeleiteten Traffic (in den Einstellungen abschaltbar).'
+                      : 'Kill Switch aus – LAN-Traffic geht direkt ins Internet.'}
               </div>
             </div>
           </div>
@@ -287,6 +383,8 @@ export default function App() {
           <Chip label="Letzter Handshake" value={status?.latest_handshake} />
           <Chip label="Transfer" value={status?.transfer} />
           <Chip label="Gateway-IP im LAN" value={status?.gateway_ip} />
+          <Chip label="Tunnel-Forward" value={counters.tunnel_fwd ? `${fmtBytes(counters.tunnel_fwd.bytes)} · ${counters.tunnel_fwd.packets} Pkt.` : null} />
+          <Chip label="DNS-Forward" value={counters.dns ? `${fmtBytes(counters.dns.bytes)} · ${counters.dns.packets} Pkt.` : null} />
         </div>
       </Card>
 
@@ -319,7 +417,7 @@ export default function App() {
                 </>
               )}
               <p className="sub">
-                Tunnel: {test.tunnel_up ? 'up' : 'down'} · Kill Switch: {test.killswitch_active ? 'aktiv' : 'inaktiv'}
+                Tunnel: {test.tunnel_up ? 'up' : 'down'} · Kill Switch: {test.killswitch_active ? 'aktiv' : 'aus'}
               </p>
             </div>
           ) : (
@@ -327,6 +425,68 @@ export default function App() {
               „Test“ fragt mehrere IP-Dienste <em>über das Tunnel-Interface</em> ab – eine Antwort
               kann nur durch den Tunnel kommen.
             </p>
+          )}
+        </Card>
+
+        <Card title="Firewall & Einstellungen" icon="🧯">
+          <p className="sub">Gilt für alle LAN-Clients, die den CT als Gateway nutzen.</p>
+          {settings ? (
+            <>
+              <Toggle
+                checked={!!settings.killswitch}
+                onChange={(v) => setSettings({ ...settings, killswitch: v })}
+                label="Kill Switch"
+                hint="Aus = bei getrenntem Tunnel geht LAN-Traffic direkt ins Internet (ohne VPN-Schutz)."
+              />
+              <Toggle
+                checked={!!settings.watchdog}
+                onChange={(v) => setSettings({ ...settings, watchdog: v })}
+                label="Tunnel-Watchdog"
+                hint="Startet den Tunnel automatisch neu, wenn der Handshake über 3 Min. stillsteht."
+              />
+              <label className="field">
+                <span>DNS-Server im LAN (AdGuard / Pi-hole), kommagetrennt</span>
+                <input
+                  type="text"
+                  value={settings._dns || ''}
+                  onChange={(e) => setSettings({ ...settings, _dns: e.target.value })}
+                  placeholder="z. B. 192.168.1.111"
+                />
+              </label>
+              <p className="sub tiny">
+                DNS zu diesen IPs umgeht den Kill Switch immer – Clients behalten deinen Werbe- und
+                Tracker-Filter, auch wenn der Tunnel gerade getrennt ist.
+              </p>
+              <label className="field">
+                <span>Nur dieses Subnetz darf das Gateway nutzen (CIDR, leer = alle Geräte)</span>
+                <input
+                  type="text"
+                  value={settings.allow_cidr || ''}
+                  onChange={(e) => setSettings({ ...settings, allow_cidr: e.target.value })}
+                  placeholder="z. B. 192.168.1.0/24"
+                />
+              </label>
+              <div className="btns">
+                <button className="btn primary" disabled={busy !== null} onClick={saveSettings}>
+                  {busy === 'settings' ? <span className="spin" /> : dirty ? '💾 Anwenden *' : '💾 Anwenden'}
+                </button>
+                <button className="btn" disabled={busy !== null || !(settings.dns_servers || []).length} onClick={runDnsTest}>
+                  {busy === 'dnstest' ? <span className="spin" /> : '🔍 DNS-Test'}
+                </button>
+              </div>
+              {dirty && <p className="sub tiny warn">* ungespeicherte Änderungen</p>}
+              {dnsTest && (
+                <div className="stat">
+                  {dnsTest.map((r) => (
+                    <p key={r.server}>
+                      {r.ok ? '✅' : '❌'} {r.server} {r.ok ? `– erreichbar (${r.ms} ms)` : `– ${r.error}`}
+                    </p>
+                  ))}
+                </div>
+              )}
+            </>
+          ) : (
+            <p className="sub">Lade Einstellungen…</p>
           )}
         </Card>
 

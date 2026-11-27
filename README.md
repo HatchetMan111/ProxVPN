@@ -8,10 +8,18 @@ Native **WireGuard**-Verbindung zu **ProtonVPN**, **permanenter nftables-Kill-Sw
 - Läuft komplett lokal, keine Cloud-Dienste
 - Unprivileged LXC (~1 GB RAM, 4 GB Disk, `onboot: 1`, nesting)
 - Web UI auf Port **8090** (bindet `0.0.0.0`, **Passwort-Login**, Session-Tokens)
+- **Kill Switch per UI schaltbar** (aus = bei getrenntem Tunnel geht LAN-Traffic direkt raus)
+- **DNS-Integration (AdGuard / Pi-hole)**: konfigurierte DNS-IPs umgehen den Kill Switch immer –
+  der Werbe-/Tracker-Filter bleibt aktiv, auch wenn der Tunnel gerade getrennt ist
+- **Gateway-CIDR per UI** einschränkbar (welche Geräte das Gateway nutzen dürfen)
+- **Tunnel-Watchdog**: startet den Tunnel neu, wenn der Handshake > 3 Min. stillsteht
+- **Traffic-Zähler** pro Regel (Tunnel-Forward, DNS-Forward) direkt in der UI
 - systemd-Service mit `Restart=always` nach `network-online.target`
 - WireGuard-Interface: `proton` (aus `/etc/wireguard/proton.conf`)
 - Tunnel verbindet nach Reboot automatisch neu (`wg-quick@proton`)
 - **Kein Node.js im Container** – das Frontend wird vorab gebaut und mitgeliefert
+- Die nftables-Config wird zentral vom Backend aus `/etc/proxvpn/settings.json` generiert –
+  Installer und Web UI nutzen dieselbe Logik und können nie auseinanderlaufen
 
 ## Installation (Einzeiler auf dem Proxmox-Host)
 
@@ -36,7 +44,10 @@ Optionale Variablen vor dem Einzeiler:
 | `BRIDGE` | vmbr0 | Bridge |
 | `VLAN` | – | VLAN-Tag (optional) |
 | `ROOTFS_STORAGE` | auto | erster lvm-thin, sonst `local-lvm` |
-| `ALLOW_CIDR` | – (alle) | nur dieses Subnetz darf das Gateway nutzen (Forwarding) |
+| `ALLOW_CIDR` | – (alle) | nur dieses Subnetz darf das Gateway nutzen (später per UI änderbar) |
+| `DNS_SERVERS` | – | kommagetrennte LAN-DNS-IPs (AdGuard/Pi-hole), umgehen den Kill Switch |
+| `KILL_SWITCH` | 1 | `0` = Kill Switch ab Installation aus |
+| `WATCHDOG` | 1 | `0` = Tunnel-Watchdog deaktivieren |
 | `WEB_PASSWORD` | Zufall | Web-UI-Passwort explizit setzen |
 | `NO_IPV6` | 0 | `1` = IPv6-Kill-Switch überspringen |
 | `UPDATE` | 0 | `1` = bestehenden Container aktualisieren (Config + Passwort bleiben) |
@@ -61,9 +72,17 @@ Das **Web-UI-Passwort** wird am Ende der Installation ausgegeben (und steht in
 
 ### Als Gateway nutzen
 
-Clients tragen die LXC-IP als Default-Gateway ein, oder der Router bekommt eine
-statische Route über den Container. Der Kill Switch erlaubt Forwarding **nur**
-über das WireGuard-Interface, sonst `policy drop` – für IPv4 und IPv6:
+Der CT ist ein **One-Armed-Gateway**: ein einziges `eth0` an der Bridge, kein
+zweites Interface. Forwarding passiert im CT zwischen `eth0` und dem
+WireGuard-Interface `proton`. Clients tragen die LXC-IP als Default-Gateway ein,
+oder der Router bekommt eine statische Route über den Container (für weitere
+Subnetze wie ein zweites VLAN). DNS sollen Clients **direkt** an deinen
+AdGuard/Pi-hole schicken – einfach als DNS-Server mitverteilen (z. B. über die
+DHCP-Einstellungen des Routers); der Gateway lässt Port 53 zu diesen IPs
+immer durch.
+
+Der Kill Switch erlaubt Forwarding **nur** über das WireGuard-Interface, sonst
+`policy drop` – für IPv4 und IPv6, per UI abschaltbar:
 
 ```text
 table inet proxvpn {
@@ -139,6 +158,9 @@ API-Endpoints:
 | `/api/disconnect` | POST | `wg-quick down proton` (idempotent) |
 | `/api/test` | POST | Public-IP-Test **durch** das Tunnel-Interface |
 | `/api/config` | POST | WireGuard-Config speichern (validiert, Auto-Reconnect) |
+| `/api/settings` | GET/POST | Kill Switch, DNS-Server, CIDR, Watchdog (baut Firewall neu) |
+| `/api/dnstest` | POST | Erreichbarkeitstest der konfigurierten DNS-Server (Port 53) |
+| `/api/stats` | GET | Traffic-Zähler aus der Forward-Chain |
 | `/api/logs` | GET | letzte Service-Logzeilen |
 
 Fehler werden immer als **komplette Meldungskette** zurückgegeben

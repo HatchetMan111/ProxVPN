@@ -20,11 +20,14 @@ grep -q 'UPDATE=1' "$REPO/install/proxvpn.sh" && ok "UPDATE mode documented" || 
 grep -q 'app/backend/static/index.html' "$REPO/install/proxvpn.sh" && ok "installer verifies prebuilt frontend" || bad "installer verifies prebuilt frontend"
 grep -q 'nodejs npm' "$REPO/install/proxvpn.sh" && bad "installer still installs nodejs/npm" || ok "no Node in CT"
 grep -q 'Web UI password' "$REPO/install/proxvpn.sh" && ok "installer prints UI password" || bad "installer prints UI password"
-grep -q 'proxvpn6' "$REPO/install/proxvpn.sh" && ok "IPv6 kill switch present" || bad "IPv6 kill switch present"
+grep -q 'proxvpn6' "$REPO/app/backend/main.py" && ok "IPv6 kill switch present (backend template)" || bad "IPv6 kill switch present"
 grep -q 'ALLOW_CIDR' "$REPO/install/proxvpn.sh" && ok "ALLOW_CIDR forwarding limit present" || bad "ALLOW_CIDR forwarding limit present"
 grep -q 'write_auth_file' "$REPO/install/proxvpn.sh" && ok "auth file written via argv (stdin-safe)" || bad "auth file written via argv"
 grep -q 'write_killswitch' "$REPO/install/proxvpn.sh" && ok "kill switch shared by install+update" || bad "kill switch shared by install+update"
 grep -q 'PROXVPN_WEB_PORT' "$REPO/install/proxvpn.sh" && ok "unit exports PROXVPN_WEB_PORT" || bad "unit exports PROXVPN_WEB_PORT"
+grep -q 'main.py regen' "$REPO/install/proxvpn.sh" && ok "installer regenerates firewall via backend" || bad "installer regenerates firewall via backend"
+grep -q 'proxvpn-watchdog.timer' "$REPO/install/proxvpn.sh" && ok "watchdog timer installed" || bad "watchdog timer installed"
+grep -q 'write_settings_file' "$REPO/install/proxvpn.sh" && ok "settings.json bootstrap present" || bad "settings.json bootstrap present"
 test -f "$REPO/app/backend/static/index.html" && ok "dist committed" || bad "dist committed"
 grep -q 'proxvpn_token' "$REPO/app/frontend/src/App.jsx" && ok "frontend login gate present" || bad "frontend login gate present"
 
@@ -51,7 +54,30 @@ fi
 EOF
 cat > "$TMP/bin/nft" <<'EOF'
 #!/bin/bash
-[[ "$1" == "list" ]] && { echo "chain forward { type filter hook forward priority 0; policy drop; iifname \"eth0\" oifname \"proton\" accept }"; exit 0; }
+if [[ "$1" == "-f" ]]; then
+  # validate the rendered file roughly like nft would: must parse as conf text
+  grep -q "table inet proxvpn" "$2" || exit 1
+  exit 0
+fi
+if [[ "$1" == "list" && "$2" == "chain" ]]; then
+  cat <<'OUT'
+table inet proxvpn {
+  chain forward {
+    type filter hook forward priority 0; policy drop;
+    ct state established,related accept
+    iifname "eth0" oifname "proton" counter packets 1234 bytes 5678000 accept comment "tunnel_fwd"
+    iifname "proton" oifname "eth0" counter packets 1000 bytes 300000 accept comment "tunnel_rev"
+    ip daddr 192.168.178.111 udp dport 53 counter packets 50 bytes 4000 accept comment "dns"
+    ip daddr 192.168.178.111 tcp dport 53 counter packets 2 bytes 200 accept comment "dns"
+  }
+}
+OUT
+  exit 0
+fi
+exit 0
+EOF
+cat > "$TMP/bin/systemctl" <<'EOF'
+#!/bin/bash
 exit 0
 EOF
 cat > "$TMP/bin/ip" <<'EOF'
@@ -73,10 +99,11 @@ export PATH="$TMP/bin:$PATH"
 export MOCK_WG_UP="$TMP/wg.up"; touch "$MOCK_WG_UP"
 export PROXVPN_AUTH_FILE="$TMP/etc/auth.json"
 export PROXVPN_WG_CONF="$TMP/wg/proton.conf"; mkdir -p "$TMP/wg"
-export PROXVPN_WEB_PORT=8090
+export PROXVPN_SETTINGS_FILE="$TMP/etc/settings.json"
+export PROXVPN_NFT_CONF="$TMP/etc/nftables.conf"
 
 python3 - "$REPO/app/backend" <<'PY' || bad "backend test run"
-import importlib.util, json, sys, pathlib
+import importlib.util, json, os, sys, pathlib
 sys.path.insert(0, sys.argv[1])
 spec = importlib.util.spec_from_file_location("proxvpn_main", sys.argv[1] + "/main.py")
 m = importlib.util.module_from_spec(spec)
@@ -131,6 +158,51 @@ r = c2.post("/api/logout", headers={"Authorization": f"Bearer {tok}"})
 ck("logout ok", r.status_code == 200)
 ck("token dead after logout", c2.get("/api/status", headers={"Authorization": f"Bearer {tok}"}).status_code == 401)
 ck("auth file mode 600", oct(m.AUTH_FILE.stat().st_mode)[-3:] == "600")
+
+# --- settings + firewall engine (auth is on by now -> use a token client) ---
+tok3 = c2.post("/api/login", json={"password": "secret123"}).json()["token"]
+H3 = {"Authorization": f"Bearer {tok3}"}
+r = c2.get("/api/settings", headers=H3)
+ck("settings GET returns defaults", r.status_code == 200 and r.json()["killswitch"] is True)
+nft_conf = pathlib.Path(os.environ["PROXVPN_NFT_CONF"])
+if not nft_conf.exists():
+    reg = m.regen_firewall(); ck("regen initial ok", reg["ok"] is True)
+ck("regen renders forward drop", "policy drop" in nft_conf.read_text())
+ck("regen renders v6 table", "proxvpn6" in nft_conf.read_text())
+ck("regen renders dns bypass", "dport 53" not in nft_conf.read_text())  # no dns configured yet
+
+r = c2.post("/api/settings", headers=H3, json={"dns_servers": ["not-an-ip"]})
+ck("bad dns rejected 400", r.status_code == 400)
+r = c2.post("/api/settings", headers=H3, json={"allow_cidr": "300.1.2.3/24"})
+ck("bad cidr rejected 400", r.status_code == 400)
+
+# kill switch OFF + DNS allowed + cidr
+r = c2.post("/api/settings", headers=H3, json={"killswitch": False, "dns_servers": ["192.168.178.111", "192.168.178.112"], "allow_cidr": "192.168.178.0/24"})
+ck("settings POST ok", r.status_code == 200 and r.json()["ok"] is True)
+conf = nft_conf.read_text()
+ck("killswitch off = accept policy", "policy accept" in conf)
+ck("cidr rule rendered", "ip saddr 192.168.178.0/24" in conf)
+ck("dns bypass rules rendered", conf.count("dport 53") == 4)  # 2 servers x udp+tcp
+st = json.loads(pathlib.Path(os.environ["PROXVPN_SETTINGS_FILE"]).read_text())
+ck("settings persisted", st["killswitch"] is False and st["watchdog"] is True)
+ck("dns normalized", st["dns_servers"] == ["192.168.178.111", "192.168.178.112"])
+
+# kill switch back ON
+r = c2.post("/api/settings", headers=H3, json={"killswitch": True})
+ck("killswitch re-enabled", r.status_code == 200 and "policy drop" in nft_conf.read_text())
+
+r = c2.post("/api/dnstest", headers=H3)
+ck("dnstest returns structure", r.status_code == 200 and isinstance(r.json()["results"], list))
+
+r = c2.get("/api/stats", headers=H3)
+ck("stats parsed", r.status_code == 200 and r.json()["counters"].get("tunnel_fwd", {}).get("packets") == 1234)
+ck("stats dns counter", r.json()["counters"].get("dns", {}).get("bytes") == 4200)
+
+# regen CLI entrypoint (installer path)
+import subprocess as sp
+env = {k: v for k, v in os.environ.items()}
+pr = sp.run([sys.executable, sys.argv[1] + "/main.py", "regen"], capture_output=True, text=True, env=env)
+ck("main.py regen exit 0", pr.returncode == 0 and '"ok": true' in pr.stdout)
 
 # --- tunnel down path ---
 import os; os.environ["MOCK_WG_UP"] = "/nonexistent"

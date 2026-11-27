@@ -237,6 +237,47 @@ pre {
   to   { opacity: 1; transform: translateY(0); }
 }
 
+/* ---------- toggles ---------- */
+.toggle-row {
+  display: flex; align-items: flex-start; gap: 12px;
+  padding: 10px 0; cursor: pointer; user-select: none;
+}
+.toggle-row + .toggle-row { border-top: 1px dashed rgba(120, 134, 220, 0.12); }
+.toggle { position: relative; width: 46px; height: 26px; flex-shrink: 0; margin-top: 2px; }
+.toggle input { position: absolute; opacity: 0; width: 100%; height: 100%; margin: 0; cursor: pointer; z-index: 2; }
+.toggle .knob {
+  position: absolute; inset: 0; border-radius: 999px;
+  background: rgba(10, 15, 30, 0.7); border: 1px solid var(--card-hover);
+  transition: background 0.2s, border-color 0.2s;
+}
+.toggle .knob::after {
+  content: ''; position: absolute; top: 3px; left: 3px;
+  width: 18px; height: 18px; border-radius: 50%;
+  background: var(--muted); transition: transform 0.2s, background 0.2s;
+}
+.toggle input:checked + .knob { background: rgba(52, 211, 153, 0.25); border-color: rgba(52, 211, 153, 0.6); }
+.toggle input:checked + .knob::after { transform: translateX(20px); background: var(--ok); }
+.toggle-text { display: flex; flex-direction: column; gap: 2px; }
+.toggle-text strong { font-size: 0.92rem; font-weight: 600; }
+.toggle-text em { font-style: normal; color: var(--muted); font-size: 0.8rem; line-height: 1.4; }
+
+/* ---------- form fields ---------- */
+.field { display: flex; flex-direction: column; gap: 5px; margin-top: 12px; }
+.field span { font-size: 0.8rem; color: var(--muted); }
+.field input {
+  background: rgba(10, 15, 30, 0.65);
+  color: var(--text);
+  border: 1px solid var(--card-hover);
+  border-radius: 10px;
+  padding: 9px 12px;
+  font-size: 0.9rem;
+  font-family: ui-monospace, monospace;
+  outline: none;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+.field input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(109, 124, 255, 0.18); }
+.sub.tiny { font-size: 0.76rem; margin: 6px 0 2px; }
+
 /* ---------- footer ---------- */
 .foot {
   margin-top: 26px; text-align: center;

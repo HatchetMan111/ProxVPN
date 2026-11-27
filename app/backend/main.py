@@ -21,11 +21,13 @@ stays open (the installer always writes the file and prints the password once).
 from __future__ import annotations
 
 import hmac
+import ipaddress
 import json
 import os
 import re
 import secrets
 import shutil
+import socket
 import subprocess
 import time
 from pathlib import Path
@@ -44,6 +46,16 @@ AUTH_FILE = Path(os.environ.get("PROXVPN_AUTH_FILE", "/etc/proxvpn/auth.json"))
 
 WEB_PORT = int(os.environ.get("PROXVPN_WEB_PORT", "8090"))
 TOKEN_TTL = 12 * 3600  # seconds a session token stays valid
+
+SETTINGS_FILE = Path(os.environ.get("PROXVPN_SETTINGS_FILE", "/etc/proxvpn/settings.json"))
+NFT_CONF = Path(os.environ.get("PROXVPN_NFT_CONF", "/etc/nftables.conf"))
+WATCHDOG_TIMER = "proxvpn-watchdog.timer"
+SETTINGS_DEFAULTS = {
+    "killswitch": True,      # forward policy drop unless traffic goes via the tunnel
+    "dns_servers": [],       # LAN DNS (AdGuard / Pi-hole) allowed directly, not via tunnel
+    "allow_cidr": "",        # only this subnet may use the gateway ('' = every client)
+    "watchdog": True,        # auto-reconnect the tunnel when the handshake goes stale
+}
 
 # API paths reachable without a token: liveness probe, pre-login auth probe,
 # and login itself (needed to obtain a token)
@@ -161,6 +173,129 @@ def logout(request: Request):
 def auth_state():
     """Whether a login is required (the UI calls this before anything else)."""
     return {"auth_enabled": _auth_enabled()}
+
+
+# --------------------------- settings + firewall engine ---------------------------
+# /etc/proxvpn/settings.json is the single source of truth for the nftables
+# kill switch. Both the installer (python main.py regen) and the Web UI
+# (POST /api/settings) regenerate /etc/nftables.conf from it, so they can
+# never drift apart.
+def _settings() -> dict:
+    try:
+        data = json.loads(SETTINGS_FILE.read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _merged_settings() -> dict:
+    st = dict(SETTINGS_DEFAULTS)
+    st.update({k: v for k, v in _settings().items() if k in SETTINGS_DEFAULTS})
+    return st
+
+
+def _save_settings(st: dict) -> None:
+    SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = SETTINGS_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(st, indent=2))
+    tmp.chmod(0o600)
+    tmp.replace(SETTINGS_FILE)
+
+
+def _norm_dns_servers(raw) -> tuple[list[str], list[str]]:
+    """Split input into normalized IPs and rejected entries (with reason)."""
+    ok, bad = [], []
+    for item in raw or []:
+        entry = str(item).strip()
+        if not entry:
+            continue
+        try:
+            ok.append(str(ipaddress.ip_address(entry)))
+        except ValueError:
+            bad.append(f"{entry}: not an IP address (AdGuard/Pi-hole are given as IP)")
+    return ok, bad
+
+
+def _validate_cidr(raw: str) -> str:
+    cidr = str(raw or "").strip()
+    if not cidr:
+        return ""
+    ipaddress.ip_network(cidr, strict=False)  # raises ValueError -> 400
+    return cidr
+
+
+def _render_nftables(st: dict) -> str:
+    """Render the complete nftables.conf (IPv4 + IPv6) from settings."""
+    ks = bool(st.get("killswitch", True))
+    cidr = _validate_cidr(st.get("allow_cidr", ""))
+    dns, _bad = _norm_dns_servers(st.get("dns_servers", []))
+    policy = "drop" if ks else "accept"
+    src = f"ip saddr {cidr} " if cidr else ""
+
+    fwd = [
+        "    ct state established,related accept",
+        f'    iifname "eth0" {src}oifname "{WG_IF}" counter accept comment "tunnel_fwd"',
+        f'    iifname "{WG_IF}" oifname "eth0" counter accept comment "tunnel_rev"',
+    ]
+    for ip in dns:  # LAN DNS answers directly, never squeezed through the tunnel
+        fwd.append(f'    ip daddr {ip} udp dport 53 counter accept comment "dns"')
+        fwd.append(f'    ip daddr {ip} tcp dport 53 counter accept comment "dns"')
+
+    return f"""#!/usr/sbin/nft -f
+flush ruleset
+
+table inet proxvpn {{
+  chain input {{
+    type filter hook input priority 0; policy accept;
+    tcp dport {WEB_PORT} accept
+  }}
+  chain forward {{
+    type filter hook forward priority 0; policy {policy};
+{chr(10).join(fwd)}
+  }}
+  chain postrouting {{
+    type nat hook postrouting priority 100;
+    oifname "{WG_IF}" masquerade
+  }}
+}}
+
+table inet proxvpn6 {{
+  chain forward {{
+    type filter hook forward priority 0; policy {policy};
+  }}
+  chain postrouting {{
+    type nat hook postrouting priority 100;
+    oifname "{WG_IF}" masquerade
+  }}
+}}
+"""
+
+
+def regen_firewall() -> dict:
+    """Write nftables.conf from settings and apply it. Never raises."""
+    st = _merged_settings()
+    try:
+        text = _render_nftables(st)
+    except ValueError as e:
+        return {"ok": False, "error": f"invalid setting: {e}"}
+    previous = NFT_CONF.read_text() if NFT_CONF.exists() else None
+    try:
+        NFT_CONF.parent.mkdir(parents=True, exist_ok=True)
+        NFT_CONF.write_text(text)
+    except OSError as e:
+        return {"ok": False, "error": f"cannot write {NFT_CONF}: {e}"}
+    rc, out, err = _run(["nft", "-f", str(NFT_CONF)])
+    if rc != 0 and previous is not None:
+        NFT_CONF.write_text(previous)  # leave the box in its previous state
+        _run(["nft", "-f", str(NFT_CONF)])
+        return {"ok": False, "error": f"nft -f failed: {err or out}", **_full_chain(rc, out, err, ["nft", "-f", str(NFT_CONF)])}
+    _run(["bash", "-c", "sysctl -q -w net.ipv4.ip_forward=1"])
+    return {"ok": rc == 0, "error": None if rc == 0 else (err or out)}
+
+
+def _set_watchdog(enabled: bool) -> None:
+    cmd = ["systemctl", "enable", "--now", WATCHDOG_TIMER] if enabled else ["systemctl", "disable", "--now", WATCHDOG_TIMER]
+    _run(cmd)
 
 
 # --------------------------- status helpers ---------------------------
@@ -335,6 +470,94 @@ def save_config(body: dict):
     return {"ok": True, "saved": str(WG_CONF), "auto_reconnect": True}
 
 
+@app.get("/api/settings")
+def get_settings():
+    return _merged_settings()
+
+
+@app.post("/api/settings")
+def set_settings(body: dict):
+    st = _merged_settings()
+    errors = []
+
+    if "killswitch" in body:
+        st["killswitch"] = bool(body["killswitch"])
+
+    if "watchdog" in body:
+        st["watchdog"] = bool(body["watchdog"])
+
+    if "dns_servers" in body:
+        dns, bad = _norm_dns_servers(body["dns_servers"])
+        if bad:
+            errors.extend(bad)
+        st["dns_servers"] = dns
+
+    if "allow_cidr" in body:
+        try:
+            st["allow_cidr"] = _validate_cidr(body["allow_cidr"])
+        except ValueError as e:
+            errors.append(f"allow_cidr: {e}")
+
+    if errors:
+        raise HTTPException(400, "; ".join(errors))
+
+    _save_settings(st)
+    fw = regen_firewall()
+    if not fw["ok"]:
+        raise HTTPException(500, f"Firewall could not be applied: {fw.get('error')}")
+    _set_watchdog(bool(st["watchdog"]))
+    return {"ok": True, "settings": st, "firewall": fw, **_wg_status()}
+
+
+@app.post("/api/dnstest")
+def dnstest():
+    """TCP-connect to port 53 of every configured DNS server (reachability)."""
+    results = []
+    for ip in _merged_settings().get("dns_servers", []):
+        t0 = time.monotonic()
+        try:
+            with socket.create_connection((ip, 53), timeout=5):
+                ok = True
+                err = None
+        except OSError as e:
+            ok = False
+            err = str(e)
+        results.append({
+            "server": ip,
+            "ok": ok,
+            "ms": round((time.monotonic() - t0) * 1000) if ok else None,
+            "error": err,
+        })
+    return {"ok": True, "results": results,
+            "hint": "Clients should use these DNS servers directly (e.g. via DHCP); the gateway lets DNS to them pass the kill switch."}
+
+
+def _parse_counters(out: str) -> dict:
+    stats: dict = {}
+    for line in out.splitlines():
+        line = line.strip()
+        m = re.search(r'comment "(\w+)"', line)
+        c = re.search(r"counter packets (\d+) bytes (\d+)", line)
+        if not (m and c):
+            continue
+        name = m.group(1)
+        prev = stats.get(name, {"packets": 0, "bytes": 0})
+        stats[name] = {
+            "packets": prev["packets"] + int(c.group(1)),
+            "bytes": prev["bytes"] + int(c.group(2)),
+        }
+    return stats
+
+
+@app.get("/api/stats")
+def stats():
+    """Per-rule traffic counters from the forward chain (tunnel vs. DNS)."""
+    rc, out, err = _run(["nft", "list", "chain", "inet", "proxvpn", "forward"])
+    if rc != 0:
+        return {"ok": False, "error": err or "nft list failed", "counters": {}}
+    return {"ok": True, "counters": _parse_counters(out)}
+
+
 @app.get("/api/logs")
 def logs():
     rc, out, err = _run(["journalctl", "-u", "proxvpn", "-n", "100", "--no-pager"])
@@ -352,3 +575,11 @@ def index():
 _assets = STATIC_DIR / "assets"
 _assets.mkdir(parents=True, exist_ok=True)
 app.mount("/assets", StaticFiles(directory=str(_assets)), name="assets")
+
+if __name__ == "__main__":
+    # installer entrypoint: python3 main.py regen
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "regen":
+        result = regen_firewall()
+        print(json.dumps(result))
+        sys.exit(0 if result.get("ok") else 1)
