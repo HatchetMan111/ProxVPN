@@ -11,7 +11,8 @@
 # Install (on the Proxmox host):
 #   bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/ProxVPN/main/install/proxvpn.sh)"
 #
-# Update an existing proxvpn container (keeps config, password, tunnel):
+# Update an existing proxvpn container (keeps tunnel config; password is kept
+# or bootstrapped if the container was installed before auth existed):
 #   UPDATE=1 bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/ProxVPN/main/install/proxvpn.sh)"
 #
 # Debug install (full trace):
@@ -35,6 +36,7 @@ WG_IF="proton"                 # wireguard interface name (matches /etc/wireguar
 ALLOW_CIDR="${ALLOW_CIDR:-}"   # empty = any LAN client may use the gateway
 NO_IPV6="${NO_IPV6:-0}"        # 1 = do not install the IPv6 kill switch
 UPDATE="${UPDATE:-0}"          # 1 = update an existing proxvpn container in place
+REINSTALL="${REINSTALL:-0}"    # 1 = destroy existing proxvpn CT and rebuild
 
 CT_ID="${CT_ID:-auto}"         # next free ID if "auto"
 CT_NAME="${APP}"
@@ -45,7 +47,8 @@ BRIDGE="${BRIDGE:-vmbr0}"
 VLAN="${VLAN:-}"
 TAGS="${TAGS:-proxvpn;vpn}"
 ROOTFS_STORAGE="${ROOTFS_STORAGE:-auto}"   # "auto" = first lvm/lvmthin storage, fallback local-lvm
-REINSTALL="${REINSTALL:-0}"    # 1 = destroy existing proxvpn CT and rebuild
+
+UI_PW=""
 
 # ----------------------- HELPERS -----------------------
 YW=$(echo "\033[33m"); RD=$(echo "\033[01;31m"); GN=$(echo "\033[1;92m"); CL=$(echo "\033[m")
@@ -78,6 +81,122 @@ catch() {
   exit "$1"
 }
 
+find_ct() { pct list 2>/dev/null | awk -v name="$CT_NAME" 'NR>1 && $NF==name {print $1; exit}'; }
+
+# Password: explicit via WEB_PASSWORD, else random (host python3, PVE ships it)
+gen_password() {
+  if [[ -n "${WEB_PASSWORD:-}" ]]; then
+    printf '%s' "$WEB_PASSWORD"
+  else
+    python3 -c 'import secrets; print(secrets.token_urlsafe(12))'
+  fi
+}
+
+# Write /etc/proxvpn/auth.json inside the CT. The password travels as an argv
+# element (never through stdin or a quoted heredoc), so special characters are
+# safe. Runs via bash -ec with $1 = password.
+write_auth_file() {
+  pct exec "$CT_ID" -- bash -ec '
+    set -e
+    mkdir -p /etc/proxvpn
+    python3 - "$1" <<PYEOF
+import json, pathlib, sys
+p = pathlib.Path("/etc/proxvpn/auth.json")
+tmp = p.with_suffix(".tmp")
+tmp.write_text(json.dumps({"password": sys.argv[1], "tokens": {}}))
+tmp.chmod(0o600)
+tmp.replace(p)
+PYEOF
+  ' _ "$1"
+}
+
+# systemd unit (idempotent; also rewritten on UPDATE)
+write_unit() {
+  pct exec "$CT_ID" -- bash -ec 'cat > /etc/systemd/system/proxvpn.service <<EOF
+[Unit]
+Description=ProxVPN Gateway Web UI
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/proxvpn/app/backend
+Environment=PROXVPN_WEB_PORT='"$WEB_PORT"'
+ExecStart=/opt/proxvpn/venv/bin/uvicorn main:app --host 0.0.0.0 --port '"$WEB_PORT"'
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable proxvpn >/dev/null 2>&1
+  systemctl restart proxvpn
+'
+}
+
+# nftables kill switch (idempotent; file is fully rewritten, no append-duplicates)
+write_killswitch() {
+  local FORWARD_SRC=""
+  [[ -n "$ALLOW_CIDR" ]] && FORWARD_SRC="ip saddr ${ALLOW_CIDR}"
+  msg_info "Installing nftables kill switch (forward: only via ${WG_IF})"
+  pct exec "$CT_ID" -- bash -ec 'cat > /etc/nftables.conf <<EOF
+#!/usr/sbin/nft -f
+flush ruleset
+
+table inet proxvpn {
+  chain input {
+    type filter hook input priority 0; policy accept;
+    tcp dport '"$WEB_PORT"' accept
+  }
+  chain forward {
+    type filter hook forward priority 0; policy drop;
+    ct state established,related accept
+    iifname "eth0" oifname "'"$WG_IF"'" '"$FORWARD_SRC"' accept
+    iifname "'"$WG_IF"'" oifname "eth0" accept
+  }
+  chain postrouting {
+    type nat hook postrouting priority 100;
+    oifname "'"$WG_IF"'" masquerade
+  }
+}
+EOF
+'
+  if [[ "$NO_IPV6" != "1" ]]; then
+    # append the v6 table to the same file (rewrite-safe: v4 part is recreated
+    # above on every run, so no duplicate includes can accumulate)
+    pct exec "$CT_ID" -- bash -ec 'cat >> /etc/nftables.conf <<EOF
+
+table inet proxvpn6 {
+  chain forward {
+    type filter hook forward priority 0; policy drop;
+  }
+  chain postrouting {
+    type nat hook postrouting priority 100;
+    oifname "'"$WG_IF"'" masquerade
+  }
+}
+EOF
+'
+    msg_ok "Kill switch active: IPv4 + IPv6 forwarding only through ${WG_IF}"
+  else
+    msg_ok "Kill switch active: IPv4 forwarding only through ${WG_IF} (IPv6 skipped)"
+  fi
+  pct exec "$CT_ID" -- bash -ec '
+    nft -f /etc/nftables.conf
+    systemctl enable nftables >/dev/null 2>&1
+    cat > /etc/sysctl.d/99-proxvpn.conf <<EOF
+net.ipv4.ip_forward=1
+EOF
+    sysctl -p /etc/sysctl.d/99-proxvpn.conf >/dev/null
+  '
+}
+
+verify_service() {
+  sleep 3
+  pct exec "$CT_ID" -- bash -ec "systemctl is-active proxvpn >/dev/null && curl -fsS -m 10 http://localhost:${WEB_PORT}/api/health >/dev/null"
+}
+
 # ----------------------- PRECHECKS -----------------------
 if [[ $EUID -ne 0 ]]; then
   msg_error "This script must run as root on the Proxmox host."
@@ -86,14 +205,15 @@ fi
 for cmd in pct pvesh pveam wget; do
   command -v "$cmd" >/dev/null 2>&1 || { msg_error "Command '$cmd' not found - is this a Proxmox host?"; exit 1; }
 done
+command -v python3 >/dev/null 2>&1 || { msg_error "python3 not found on the host (needed for password generation)."; exit 1; }
 header_info
 
 # ----------------------- UPDATE MODE -----------------------
 if [[ "$UPDATE" == "1" ]]; then
-  EXISTING_CT_ID=$(pct list 2>/dev/null | awk -v name="$CT_NAME" 'NR>1 && $NF==name {print $1; exit}')
-  [[ -n "$EXISTING_CT_ID" ]] || { msg_error "UPDATE=1 but no container named '${CT_NAME}' exists."; exit 1; }
-  CT_ID="$EXISTING_CT_ID"
-  msg_info "UPDATE: refreshing ${APP} inside existing CT ${CT_ID} (config + password stay)"
+  CT_ID=$(find_ct)
+  [[ -n "$CT_ID" ]] || { msg_error "UPDATE=1 but no container named '${CT_NAME}' exists."; exit 1; }
+  msg_info "UPDATE: refreshing ${APP} inside existing CT ${CT_ID}"
+
   pct exec "$CT_ID" -- bash -ec '
     set -e
     export DEBIAN_FRONTEND=noninteractive
@@ -104,13 +224,31 @@ if [[ "$UPDATE" == "1" ]]; then
     test -f /opt/proxvpn/app/backend/main.py
     test -f /opt/proxvpn/app/backend/static/index.html || {
       echo "ERROR: bundled frontend (app/backend/static) missing in tarball" >&2; exit 1; }
+    python3 -m venv /opt/proxvpn/venv
     /opt/proxvpn/venv/bin/pip install --quiet -r /opt/proxvpn/app/backend/requirements.txt
-    systemctl restart proxvpn
   '
-  sleep 3
-  if pct exec "$CT_ID" -- bash -ec "systemctl is-active proxvpn >/dev/null && curl -fsS -m 10 http://localhost:${WEB_PORT}/api/health >/dev/null"; then
+
+  # Kill switch + unit are ours to manage: refresh both so an older install
+  # (v1 = no IPv6 rules, no auth) ends up on the same state as a fresh install.
+  write_killswitch
+  write_unit
+
+  # Auth bootstrap: keep an existing password, create one if the container
+  # predates auth (otherwise the new backend would run with the UI wide open).
+  if [[ -n "${WEB_PASSWORD:-}" ]] || ! pct exec "$CT_ID" -- test -f /etc/proxvpn/auth.json 2>/dev/null; then
+    UI_PW=$(gen_password)
+    write_auth_file "$UI_PW"
+    NEW_PW=1
+  fi
+
+  if verify_service; then
     CT_IP=$(pct exec "$CT_ID" -- hostname -I | awk '{print $1}')
     msg_ok "Update complete: http://${CT_IP}:${WEB_PORT}"
+    if [[ "${NEW_PW:-0}" == "1" ]]; then
+      echo -e "  ${GN}Web UI password (new):${CL} ${UI_PW}"
+    else
+      msg_ok "Web UI password unchanged (/etc/proxvpn/auth.json)"
+    fi
     exit 0
   fi
   msg_error "Update verification failed - service log:"
@@ -129,7 +267,7 @@ fi
 
 # ----------------------- EXISTING CONTAINER -----------------------
 # Idempotency: a container with this name may already exist from a previous run.
-EXISTING_CT_ID=$(pct list 2>/dev/null | awk -v name="$CT_NAME" 'NR>1 && $NF==name {print $1; exit}')
+EXISTING_CT_ID=$(find_ct)
 if [[ -n "$EXISTING_CT_ID" ]]; then
   if [[ "$REINSTALL" == "1" ]]; then
     msg_info "REINSTALL=1: removing existing CT ${EXISTING_CT_ID} (${CT_NAME})"
@@ -138,7 +276,7 @@ if [[ -n "$EXISTING_CT_ID" ]]; then
     msg_ok "Old container removed"
   else
     msg_error "A container named '${CT_NAME}' already exists (CT ${EXISTING_CT_ID})."
-    msg_info "Update it in place (keeps config + password):"
+    msg_info "Update it in place (keeps tunnel config + password):"
     msg_info "  UPDATE=1 bash -c \"\$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/ProxVPN/main/install/${APP}.sh)\""
     msg_info "Or remove and rebuild: REINSTALL=1 ..."
     exit 1
@@ -187,8 +325,7 @@ NET_STRING="name=eth0,bridge=${BRIDGE},ip=dhcp"
 [[ -n "$VLAN" ]] && NET_STRING="${NET_STRING},tag=${VLAN}"
 # NOTE: 'STORAGE:SIZE' lets pct create a fresh volume (e.g. vm-<id>-disk-0).
 # 'STORAGE:rootfs,size=...' would reference a non-existent existing volume
-# on lvm/lvmthin storages ("no such logical volume pve/rootfs"). The
-# 'rootdir' content type must be present, otherwise pct rejects the create.
+# on lvm/lvmthin storages ("no such logical volume pve/rootfs").
 pct create "$CT_ID" "${TEMPLATE_STORAGE}:vztmpl/${TEMPLATE}" \
   --hostname "$CT_NAME" \
   --cores "$CORES" --memory "$RAM" --swap 512 \
@@ -244,108 +381,19 @@ pct exec "$CT_ID" -- bash -ec '
 '
 msg_ok "Backend venv ready"
 
-# ----------------------- INSIDE CT: WEB UI PASSWORD -----------------------
-if [[ -n "${WEB_PASSWORD:-}" ]]; then
-  UI_PW="$WEB_PASSWORD"
-else
-  UI_PW=$(pct exec "$CT_ID" -- python3 -c 'import secrets; print(secrets.token_urlsafe(9))' | tr -d '\r\n')
-fi
-pct exec "$CT_ID" -- env PROXVPN_AUTH_FILE=/etc/proxvpn/auth.json python3 - "$UI_PW" <<'PY'
-import json, pathlib, sys
-pw = sys.argv[1]
-p = pathlib.Path("/etc/proxvpn/auth.json")
-p.parent.mkdir(parents=True, exist_ok=True)
-p.write_text(json.dumps({"password": pw, "tokens": {}}))
-p.chmod(0o600)
-PY
+# ----------------------- WEB UI PASSWORD -----------------------
+UI_PW=$(gen_password)
+write_auth_file "$UI_PW"
 msg_ok "Web UI password set (printed at the end of this install)"
 
-# ----------------------- INSIDE CT: KILL SWITCH -----------------------
-msg_info "Installing nftables kill switch (forward: only via ${WG_IF}, input: web UI only)"
-FORWARD_SRC=""
-[[ -n "$ALLOW_CIDR" ]] && FORWARD_SRC="ip saddr ${ALLOW_CIDR}"
-pct exec "$CT_ID" -- bash -ec 'cat > /etc/nftables.conf <<EOF
-#!/usr/sbin/nft -f
-flush ruleset
-
-table inet proxvpn {
-  chain input {
-    type filter hook input priority 0; policy accept;
-    tcp dport '"$WEB_PORT"' accept
-  }
-  chain forward {
-    type filter hook forward priority 0; policy drop;
-    ct state established,related accept
-    iifname "eth0" oifname "'"$WG_IF"'" '"$FORWARD_SRC"' accept
-    iifname "'"$WG_IF"'" oifname "eth0" accept
-  }
-  chain postrouting {
-    type nat hook postrouting priority 100;
-    oifname "'"$WG_IF"'" masquerade
-  }
-}
-EOF
-  nft -f /etc/nftables.conf
-  systemctl enable nftables >/dev/null 2>&1
-  cat > /etc/sysctl.d/99-proxvpn.conf <<EOF
-net.ipv4.ip_forward=1
-EOF
-  sysctl -p /etc/sysctl.d/99-proxvpn.conf >/dev/null
-'
-if [[ "$NO_IPV6" != "1" ]]; then
-  pct exec "$CT_ID" -- bash -ec 'cat > /etc/nftables-proxvpn-v6.conf <<EOF
-#!/usr/sbin/nft -f
-table inet proxvpn6 {
-  chain forward {
-    type filter hook forward priority 0; policy drop;
-  }
-  chain postrouting {
-    type nat hook postrouting priority 100;
-    oifname "'"$WG_IF"'" masquerade
-  }
-}
-EOF
-  nft -f /etc/nftables-proxvpn-v6.conf
-  printf "\ninclude /etc/nftables-proxvpn-v6.conf\n" >> /etc/nftables.conf
-  nft -f /etc/nftables.conf
-'
-  msg_ok "Kill switch active: IPv4 + IPv6 forwarding only through ${WG_IF}"
-else
-  msg_ok "Kill switch active: IPv4 forwarding only through ${WG_IF} (IPv6 skipped)"
-fi
-
-# ----------------------- INSIDE CT: SYSTEMD -----------------------
+# ----------------------- KILL SWITCH / UNIT / VERIFY -----------------------
+write_killswitch
 msg_info "Installing systemd service (Restart=always, after network-online)"
-pct exec "$CT_ID" -- bash -ec 'cat > /etc/systemd/system/proxvpn.service <<EOF
-[Unit]
-Description=ProxVPN Gateway Web UI
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-WorkingDirectory=/opt/proxvpn/app/backend
-ExecStart=/opt/proxvpn/venv/bin/uvicorn main:app --host 0.0.0.0 --port '"$WEB_PORT"'
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
-  systemctl daemon-reload
-  systemctl enable proxvpn >/dev/null 2>&1
-  systemctl restart proxvpn
-'
+write_unit
 msg_ok "Service proxvpn enabled and started"
 
-# ----------------------- VERIFICATION -----------------------
 msg_info "Verifying installation"
-sleep 3
-if ! pct exec "$CT_ID" -- bash -ec '
-  set -x
-  systemctl is-active proxvpn
-  curl -fsS -m 10 "http://localhost:'"$WEB_PORT"'/api/health"
-' >/dev/null 2>&1; then
+if ! verify_service; then
   msg_error "Verification failed - full service log follows:"
   pct exec "$CT_ID" -- journalctl -u proxvpn --no-pager -n 60 || true
   exit 1

@@ -20,8 +20,11 @@ grep -q 'UPDATE=1' "$REPO/install/proxvpn.sh" && ok "UPDATE mode documented" || 
 grep -q 'app/backend/static/index.html' "$REPO/install/proxvpn.sh" && ok "installer verifies prebuilt frontend" || bad "installer verifies prebuilt frontend"
 grep -q 'nodejs npm' "$REPO/install/proxvpn.sh" && bad "installer still installs nodejs/npm" || ok "no Node in CT"
 grep -q 'Web UI password' "$REPO/install/proxvpn.sh" && ok "installer prints UI password" || bad "installer prints UI password"
-grep -q 'nftables-proxvpn-v6.conf' "$REPO/install/proxvpn.sh" && ok "IPv6 kill switch present" || bad "IPv6 kill switch present"
+grep -q 'proxvpn6' "$REPO/install/proxvpn.sh" && ok "IPv6 kill switch present" || bad "IPv6 kill switch present"
 grep -q 'ALLOW_CIDR' "$REPO/install/proxvpn.sh" && ok "ALLOW_CIDR forwarding limit present" || bad "ALLOW_CIDR forwarding limit present"
+grep -q 'write_auth_file' "$REPO/install/proxvpn.sh" && ok "auth file written via argv (stdin-safe)" || bad "auth file written via argv"
+grep -q 'write_killswitch' "$REPO/install/proxvpn.sh" && ok "kill switch shared by install+update" || bad "kill switch shared by install+update"
+grep -q 'PROXVPN_WEB_PORT' "$REPO/install/proxvpn.sh" && ok "unit exports PROXVPN_WEB_PORT" || bad "unit exports PROXVPN_WEB_PORT"
 test -f "$REPO/app/backend/static/index.html" && ok "dist committed" || bad "dist committed"
 grep -q 'proxvpn_token' "$REPO/app/frontend/src/App.jsx" && ok "frontend login gate present" || bad "frontend login gate present"
 

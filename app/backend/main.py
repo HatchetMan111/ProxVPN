@@ -120,10 +120,15 @@ def login(body: dict):
     pw = str(body.get("password", ""))
     expected = str(_load_auth().get("password", ""))
     if not expected or not hmac.compare_digest(pw, expected):
+        time.sleep(1.0)  # crude brute-force brake (LAN service, no lockout infra)
         raise HTTPException(401, "Wrong password.")
     token = secrets.token_urlsafe(32)
     auth = _load_auth()
-    auth.setdefault("tokens", {})[token] = time.time() + TOKEN_TTL
+    tokens = auth.setdefault("tokens", {})
+    now = time.time()
+    for t in [k for k, e in tokens.items() if not isinstance(e, (int, float)) or e <= now]:
+        tokens.pop(t, None)  # prune expired entries instead of growing forever
+    tokens[token] = now + TOKEN_TTL
     _save_auth(auth)
     return {"ok": True, "token": token, "expires_in": TOKEN_TTL, "auth_enabled": True}
 

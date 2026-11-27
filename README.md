@@ -92,8 +92,14 @@ weitergeleiteten Traffic schützt, nicht den Host selbst.
 UPDATE=1 bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/ProxVPN/main/install/proxvpn.sh)"
 ```
 
-Das aktualisiert App + Backend + Frontend im bestehenden Container, lässt
-WireGuard-Config, Passwort und Kill Switch aber unberührt. Alternativ von Hand:
+Das aktualisiert App + Backend + Frontend im bestehenden Container und schreibt
+auch **Kill Switch und systemd-Unit** neu (z. B. um `ALLOW_CIDR` oder den
+IPv6-Kill-Switch nachzuziehen). Die WireGuard-Config bleibt unberührt.
+
+Das Passwort bleibt erhalten. Wurde der Container noch **vor** der Auth-Einführung
+installiert (keine `auth.json`), erzeugt das Update ein Passwort und gibt es aus –
+sonst liefe die neue Version mit offener UI. Mit `WEB_PASSWORD=...` setzt du das
+Passwort beim Update explizit neu. Alternativ von Hand:
 
 ```bash
 pct exec <CT-ID> -- bash -ec '
