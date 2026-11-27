@@ -22,21 +22,36 @@ const api = (path, opts = {}) => {
 
 let toastSeq = 0
 
-function Card({ title, icon, children, accent, wide }) {
+/* ---------- small building blocks ---------- */
+
+function Card({ title, icon, children, accent, wide, right }) {
   return (
     <div className={'card' + (accent ? ' accent' : '') + (wide ? ' wide' : '')}>
-      <h2>{icon && <span className="ico">{icon}</span>}{title}</h2>
+      {title && (
+        <h2>
+          {icon && <span className="ico">{icon}</span>}
+          {title}
+          {right && <span className="card-right">{right}</span>}
+        </h2>
+      )}
       {children}
     </div>
   )
 }
 
-function Chip({ label, value, tone }) {
-  if (value === undefined || value === null || value === '') return null
+function Led({ tone, pulse }) {
+  return <span className={'led ' + tone + (pulse ? ' pulse' : '')} />
+}
+
+function Tile({ label, tone, pulse, value, sub, mono = true }) {
   return (
-    <div className={'chip' + (tone ? ' ' + tone : '')}>
-      <span className="chip-label">{label}</span>
-      <span className="chip-value">{value}</span>
+    <div className={'tile ' + (tone || '')}>
+      <span className="tile-label">{label}</span>
+      <span className="tile-value">
+        {tone && <Led tone={tone} pulse={pulse} />}
+        <span className={mono ? 'mono' : ''}>{value ?? '—'}</span>
+      </span>
+      {sub && <span className="tile-sub">{sub}</span>}
     </div>
   )
 }
@@ -65,6 +80,57 @@ function fmtBytes(n) {
   return `${v.toFixed(v >= 100 || i === 0 ? 0 : 1)} ${units[i]}`
 }
 
+/* Live diagram: LAN -> ProxVPN -> Internet(Proton).
+   green = traffic flows through the tunnel, red = kill switch blocks,
+   amber = kill switch off, traffic leaves unfiltered. */
+function NetworkMap({ up, kill, unconfigured }) {
+  const flow = !!up
+  const blocked = !up && !!kill
+  const direct = !up && !kill
+  const hubNote = unconfigured
+    ? 'keine Config'
+    : flow
+      ? 'Tunnel aktiv'
+      : blocked
+        ? 'blockiert'
+        : 'direkt'
+  return (
+    <svg viewBox="0 0 680 118" className="netmap" role="img" aria-label="Netzwerk-Diagramm">
+      {/* LAN node */}
+      <g>
+        <rect x="16" y="26" width="168" height="66" rx="14" className={'node' + (flow ? ' live' : '')} />
+        <text x="100" y="52" textAnchor="middle" className="node-emoji">🏠</text>
+        <text x="100" y="74" textAnchor="middle" className="node-label">LAN-Clients</text>
+      </g>
+      {/* ProxVPN hub */}
+      <g>
+        <rect x="256" y="16" width="168" height="86" rx="14" className={'node hub ' + (flow ? ' ok' : blocked ? ' bad' : ' warn')} />
+        <text x="340" y="46" textAnchor="middle" className="node-emoji">🛡️</text>
+        <text x="340" y="68" textAnchor="middle" className="node-label">ProxVPN Gateway</text>
+        <text x="340" y="88" textAnchor="middle" className={'node-note ' + (flow ? 'ok' : blocked ? 'bad' : 'warn')}>{hubNote}</text>
+      </g>
+      {/* Internet node */}
+      <g>
+        <rect x="496" y="26" width="168" height="66" rx="14" className={'node' + (flow ? ' live' : '')} />
+        <text x="580" y="52" textAnchor="middle" className="node-emoji">🌐</text>
+        <text x="580" y="74" textAnchor="middle" className="node-label">Internet · ProtonVPN</text>
+      </g>
+      {/* LAN -> CT */}
+      <line x1="184" y1="59" x2="256" y2="59" className={'link ' + (flow ? ' ok' : ' dim')} />
+      <circle cx="220" cy="59" r="3" className={'pkg ' + (flow ? 'ok' : 'dim')} />
+      {/* CT -> Internet */}
+      <line x1="424" y1="59" x2="496" y2="59"
+        className={'link ' + (flow ? ' ok flow' : blocked ? ' bad block' : direct ? ' warn flow' : ' dim')} />
+      {blocked && (
+        <g>
+          <line x1="446" y1="49" x2="474" y2="69" className="xmark" />
+          <line x1="446" y1="69" x2="474" y2="49" className="xmark" />
+        </g>
+      )}
+    </svg>
+  )
+}
+
 function Toasts({ items }) {
   return (
     <div className="toasts" aria-live="polite">
@@ -74,6 +140,8 @@ function Toasts({ items }) {
     </div>
   )
 }
+
+/* ---------- login ---------- */
 
 function Login({ onDone }) {
   const [pw, setPw] = useState('')
@@ -98,12 +166,12 @@ function Login({ onDone }) {
 
   return (
     <div className="wrap narrow">
-      <header>
-        <h1><span className="logo">🛡️</span> ProxVPN Gateway</h1>
+      <header className="brand-head">
+        <span className="logo">🛡️</span>
+        <h1>ProxVPN Gateway</h1>
         <p className="sub">Anmeldung erforderlich</p>
       </header>
       <div className="card login-card">
-        <h2><span className="ico">🔑</span>Login</h2>
         <p className="sub">
           Das Passwort wurde bei der Installation im Proxmox-Log ausgegeben
           („Web UI password“). Es steht in <code>/etc/proxvpn/auth.json</code> im Container.
@@ -130,8 +198,10 @@ function Login({ onDone }) {
   )
 }
 
+/* ---------- dashboard ---------- */
+
 export default function App() {
-  const [auth, setAuth] = useState(null) // null = checking, false = open, true = login needed
+  const [auth, setAuth] = useState(null)
   const [status, setStatus] = useState(null)
   const [test, setTest] = useState(null)
   const [error, setError] = useState(null)
@@ -143,8 +213,9 @@ export default function App() {
   const [toasts, setToasts] = useState([])
   const toastId = useRef(0)
 
-  const [settings, setSettings] = useState(null) // editable draft
-  const [savedSettings, setSavedSettings] = useState(null) // server state
+  const [settings, setSettings] = useState(null)
+  const [savedSettings, setSavedSettings] = useState(null)
+  const [settingsError, setSettingsError] = useState(false)
   const [stats, setStats] = useState(null)
   const [dnsTest, setDnsTest] = useState(null)
 
@@ -169,12 +240,13 @@ export default function App() {
   }, [])
 
   const loadSettings = useCallback(async () => {
+    setSettingsError(false)
     try {
       const s = await api('settings')
       setSavedSettings(s)
       setSettings({ ...s, _dns: (s.dns_servers || []).join(', ') })
-    } catch (e) {
-      setError(e)
+    } catch {
+      setSettingsError(true)
     }
   }, [])
 
@@ -256,7 +328,6 @@ export default function App() {
       })
       setSavedSettings(r.settings)
       setSettings({ ...r.settings, _dns: (r.settings.dns_servers || []).join(', ') })
-      setStatus((s) => ({ ...s, ...r, settings: undefined }))
       toast('Einstellungen übernommen – Firewall neu aufgebaut')
       await refresh()
     } catch (e) {
@@ -312,13 +383,13 @@ export default function App() {
   const authOn = status?.auth_enabled || auth === true
   const pub = test?.public
   const unconfigured = status?.configured === false
+  const counters = stats?.counters || {}
   const dirty = settings && savedSettings && (
     settings.killswitch !== savedSettings.killswitch ||
     settings.watchdog !== savedSettings.watchdog ||
     (settings._dns || '') !== (savedSettings.dns_servers || []).join(', ') ||
     (settings.allow_cidr || '') !== (savedSettings.allow_cidr || '')
   )
-  const counters = stats?.counters || {}
 
   return (
     <div className="wrap">
@@ -332,7 +403,7 @@ export default function App() {
         </div>
         <div className="bar-right">
           <span className={'badge ' + (kill ? 'ok' : 'bad')}>
-            Kill Switch {kill === undefined ? '…' : kill ? 'aktiv' : 'AUS'}
+            {kill ? 'Kill Switch aktiv' : 'Kill Switch AUS'}
           </span>
           {authOn && (
             <button className="btn ghost" onClick={logout}>Abmelden</button>
@@ -341,54 +412,165 @@ export default function App() {
       </header>
 
       {error && (
-        <div className="card error">
-          <h2>Fehler (komplette Meldungskette)</h2>
+        <div className="card error slim">
           <pre>{typeof error.detail === 'string' ? error.detail : JSON.stringify(error, null, 2)}</pre>
         </div>
       )}
 
-      <Card wide>
-        <div className="hero">
-          <div className="hero-state">
+      {/* ===== status panel: diagram + tiles ===== */}
+      <div className="panel">
+        <div className={'panel-top ' + (up ? 'ok' : kill ? 'bad' : 'warn')}>
+          <div className="panel-headline">
             <span className={'dot ' + (up ? 'ok pulse' : 'bad')} />
             <div>
               <div className={'hero-title ' + (up ? 'ok' : 'bad')}>
-                {up ? 'Verbunden' : 'Getrennt'}
+                {up ? 'Tunnel aktiv' : 'Tunnel getrennt'}
               </div>
               <div className="sub">
                 {unconfigured
                   ? 'Noch keine ProtonVPN-Config hinterlegt – unten einfügen.'
                   : up
-                    ? 'Traffic läuft durch den Tunnel.'
+                    ? 'Gesamter Client-Traffic läuft verschlüsselt über ProtonVPN.'
                     : kill
-                      ? 'Kill Switch blockiert weitergeleiteten Traffic (in den Einstellungen abschaltbar).'
-                      : 'Kill Switch aus – LAN-Traffic geht direkt ins Internet.'}
+                      ? 'Kill Switch blockiert weitergeleiteten Traffic.'
+                      : 'Kill Switch aus – Traffic geht ungeschützt direkt ins Internet.'}
               </div>
             </div>
+            <div className="btns">
+              <button className="btn primary" disabled={busy !== null || !status?.configured || up} onClick={() => action('connect', 'Verbinden')}>
+                {busy === 'connect' ? <span className="spin" /> : '▶ Verbinden'}
+              </button>
+              <button className="btn danger" disabled={busy !== null || !up} onClick={() => action('disconnect', 'Trennen')}>
+                {busy === 'disconnect' ? <span className="spin" /> : '■ Trennen'}
+              </button>
+              <button className="btn" disabled={busy !== null} onClick={runTest}>
+                {busy === 'test' ? <span className="spin" /> : '🧪 Test'}
+              </button>
+            </div>
           </div>
-          <div className="btns">
-            <button className="btn primary" disabled={busy !== null || !status?.configured || up} onClick={() => action('connect', 'Verbinden')}>
-              {busy === 'connect' ? <span className="spin" /> : '▶ Verbinden'}
-            </button>
-            <button className="btn danger" disabled={busy !== null || !up} onClick={() => action('disconnect', 'Trennen')}>
-              {busy === 'disconnect' ? <span className="spin" /> : '■ Trennen'}
-            </button>
-            <button className="btn" disabled={busy !== null} onClick={runTest}>
-              {busy === 'test' ? <span className="spin" /> : '🧪 Test'}
-            </button>
-          </div>
+          <NetworkMap up={up} kill={kill} unconfigured={unconfigured} />
         </div>
-        <div className="chips">
-          <Chip label="Endpoint" value={status?.endpoint} />
-          <Chip label="Letzter Handshake" value={status?.latest_handshake} />
-          <Chip label="Transfer" value={status?.transfer} />
-          <Chip label="Gateway-IP im LAN" value={status?.gateway_ip} />
-          <Chip label="Tunnel-Forward" value={counters.tunnel_fwd ? `${fmtBytes(counters.tunnel_fwd.bytes)} · ${counters.tunnel_fwd.packets} Pkt.` : null} />
-          <Chip label="DNS-Forward" value={counters.dns ? `${fmtBytes(counters.dns.bytes)} · ${counters.dns.packets} Pkt.` : null} />
+        <div className="tiles">
+          <Tile
+            label="Tunnel"
+            tone={up ? 'ok' : 'bad'}
+            pulse={up}
+            value={up ? 'Verbunden' : 'Getrennt'}
+            sub={status?.endpoint || 'kein Endpoint'}
+          />
+          <Tile
+            label="Kill Switch"
+            tone={kill ? 'ok' : 'bad'}
+            value={kill ? 'aktiv' : 'aus'}
+            sub={kill ? 'Drop ohne Tunnel' : 'LAN-Traffic ungeschützt'}
+          />
+          <Tile
+            label="Öffentliche IP"
+            tone={pub?.reachable ? 'ok' : undefined}
+            value={pub?.ip ?? '—'}
+            sub={pub?.ip ? 'via Tunnel' : 'erst nach Test'}
+          />
+          <Tile
+            label="Letzter Handshake"
+            value={status?.latest_handshake ?? '—'}
+            sub="WireGuard-Peer"
+          />
+          <Tile label="Gateway-IP im LAN" value={status?.gateway_ip ?? '—'} sub="für Clients" />
+          <Tile
+            label="DNS-Bypass"
+            value={(savedSettings?.dns_servers || []).length
+              ? savedSettings.dns_servers.join(', ')
+              : 'keiner'}
+            sub="AdGuard/Pi-hole direkt"
+            mono={false}
+          />
+          <Tile
+            label="Tunnel-Forward"
+            value={counters.tunnel_fwd ? `${fmtBytes(counters.tunnel_fwd.bytes)}` : '—'}
+            sub={counters.tunnel_fwd ? `${counters.tunnel_fwd.packets} Pakete` : 'keine Daten'}
+          />
+          <Tile
+            label="DNS-Forward"
+            value={counters.dns ? `${fmtBytes(counters.dns.bytes)}` : '—'}
+            sub={counters.dns ? `${counters.dns.packets} Pakete` : 'keine Daten'}
+          />
         </div>
-      </Card>
+      </div>
 
       <div className="grid">
+        {/* ===== firewall ===== */}
+        <Card
+          title="Firewall & Einstellungen"
+          icon="🧯"
+          accent={dirty}
+          right={dirty ? <span className="warn tiny">ungenom.</span> : null}
+        >
+          {settingsError ? (
+            <div className="stat">
+              <p className="bad">Einstellungen konnten nicht geladen werden.</p>
+              <button className="btn" onClick={loadSettings}>Erneut versuchen</button>
+            </div>
+          ) : settings ? (
+            <>
+              <h3 className="sec">Schutz</h3>
+              <Toggle
+                checked={!!settings.killswitch}
+                onChange={(v) => setSettings({ ...settings, killswitch: v })}
+                label="Kill Switch"
+                hint="Aus = bei getrenntem Tunnel geht LAN-Traffic direkt ins Internet (ungeschützt)."
+              />
+              <Toggle
+                checked={!!settings.watchdog}
+                onChange={(v) => setSettings({ ...settings, watchdog: v })}
+                label="Tunnel-Watchdog"
+                hint="Startet den Tunnel neu, wenn der Handshake über 3 Min. stillsteht."
+              />
+              <h3 className="sec">DNS · AdGuard / Pi-hole</h3>
+              <label className="field">
+                <span>DNS-IPs, kommagetrennt – Port 53 dorthin umgeht den Kill Switch immer</span>
+                <input
+                  type="text"
+                  value={settings._dns || ''}
+                  onChange={(e) => setSettings({ ...settings, _dns: e.target.value })}
+                  placeholder="z. B. 192.168.1.111"
+                />
+              </label>
+              {dnsTest && (
+                <div className="dnstest">
+                  {dnsTest.map((r) => (
+                    <div key={r.server} className={'dnstest-row ' + (r.ok ? 'ok' : 'bad')}>
+                      <Led tone={r.ok ? 'ok' : 'bad'} />
+                      <span className="mono">{r.server}</span>
+                      <span className="dim">{r.ok ? `erreichbar · ${r.ms} ms` : r.error}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <h3 className="sec">Zugriff</h3>
+              <label className="field">
+                <span>Nur dieses Subnetz darf das Gateway nutzen (CIDR, leer = alle Geräte)</span>
+                <input
+                  type="text"
+                  value={settings.allow_cidr || ''}
+                  onChange={(e) => setSettings({ ...settings, allow_cidr: e.target.value })}
+                  placeholder="z. B. 192.168.1.0/24"
+                />
+              </label>
+              <div className="btns">
+                <button className="btn primary" disabled={busy !== null} onClick={saveSettings}>
+                  {busy === 'settings' ? <span className="spin" /> : '💾 Anwenden'}
+                </button>
+                <button className="btn" disabled={busy !== null || !(settings.dns_servers || []).length} onClick={runDnsTest}>
+                  {busy === 'dnstest' ? <span className="spin" /> : '🔍 DNS-Test'}
+                </button>
+              </div>
+            </>
+          ) : (
+            <p className="sub">Lade Einstellungen…</p>
+          )}
+        </Card>
+
+        {/* ===== tunnel test ===== */}
         <Card title="Verbindungstest" icon="🧪">
           {test ? (
             <div className="stat">
@@ -397,15 +579,15 @@ export default function App() {
               </p>
               {pub?.ip && (
                 <p>
-                  Öffentliche IP (über Tunnel): <strong>{pub.ip}</strong>
+                  Öffentliche IP (über Tunnel): <strong className="mono">{pub.ip}</strong>
                 </p>
               )}
               {!pub?.reachable && (
                 <>
                   {pub?.direct_ip && (
                     <p className="warn">
-                      Direkte IP (ohne Tunnel): <strong>{pub.direct_ip}</strong> – der Kill Switch
-                      schützt nur weitergeleiteten Traffic, nicht den Host selbst.
+                      Direkte IP (ohne Tunnel): <strong className="mono">{pub.direct_ip}</strong> – der
+                      Kill Switch schützt nur weitergeleiteten Traffic, nicht den Host selbst.
                     </p>
                   )}
                   {(pub?.probes || []).map((p, i) => (
@@ -423,77 +605,16 @@ export default function App() {
           ) : (
             <p className="sub">
               „Test“ fragt mehrere IP-Dienste <em>über das Tunnel-Interface</em> ab – eine Antwort
-              kann nur durch den Tunnel kommen.
+              kann nur durch den Tunnel kommen. Ergebnis landet oben bei „Öffentliche IP“.
             </p>
           )}
         </Card>
 
-        <Card title="Firewall & Einstellungen" icon="🧯">
-          <p className="sub">Gilt für alle LAN-Clients, die den CT als Gateway nutzen.</p>
-          {settings ? (
-            <>
-              <Toggle
-                checked={!!settings.killswitch}
-                onChange={(v) => setSettings({ ...settings, killswitch: v })}
-                label="Kill Switch"
-                hint="Aus = bei getrenntem Tunnel geht LAN-Traffic direkt ins Internet (ohne VPN-Schutz)."
-              />
-              <Toggle
-                checked={!!settings.watchdog}
-                onChange={(v) => setSettings({ ...settings, watchdog: v })}
-                label="Tunnel-Watchdog"
-                hint="Startet den Tunnel automatisch neu, wenn der Handshake über 3 Min. stillsteht."
-              />
-              <label className="field">
-                <span>DNS-Server im LAN (AdGuard / Pi-hole), kommagetrennt</span>
-                <input
-                  type="text"
-                  value={settings._dns || ''}
-                  onChange={(e) => setSettings({ ...settings, _dns: e.target.value })}
-                  placeholder="z. B. 192.168.1.111"
-                />
-              </label>
-              <p className="sub tiny">
-                DNS zu diesen IPs umgeht den Kill Switch immer – Clients behalten deinen Werbe- und
-                Tracker-Filter, auch wenn der Tunnel gerade getrennt ist.
-              </p>
-              <label className="field">
-                <span>Nur dieses Subnetz darf das Gateway nutzen (CIDR, leer = alle Geräte)</span>
-                <input
-                  type="text"
-                  value={settings.allow_cidr || ''}
-                  onChange={(e) => setSettings({ ...settings, allow_cidr: e.target.value })}
-                  placeholder="z. B. 192.168.1.0/24"
-                />
-              </label>
-              <div className="btns">
-                <button className="btn primary" disabled={busy !== null} onClick={saveSettings}>
-                  {busy === 'settings' ? <span className="spin" /> : dirty ? '💾 Anwenden *' : '💾 Anwenden'}
-                </button>
-                <button className="btn" disabled={busy !== null || !(settings.dns_servers || []).length} onClick={runDnsTest}>
-                  {busy === 'dnstest' ? <span className="spin" /> : '🔍 DNS-Test'}
-                </button>
-              </div>
-              {dirty && <p className="sub tiny warn">* ungespeicherte Änderungen</p>}
-              {dnsTest && (
-                <div className="stat">
-                  {dnsTest.map((r) => (
-                    <p key={r.server}>
-                      {r.ok ? '✅' : '❌'} {r.server} {r.ok ? `– erreichbar (${r.ms} ms)` : `– ${r.error}`}
-                    </p>
-                  ))}
-                </div>
-              )}
-            </>
-          ) : (
-            <p className="sub">Lade Einstellungen…</p>
-          )}
-        </Card>
-
-        <Card title="Setup" icon="⚙️" accent={unconfigured}>
+        {/* ===== setup ===== */}
+        <Card title="WireGuard-Setup" icon="⚙️" accent={unconfigured}>
           <p className="sub">
             ProtonVPN → Downloads → WireGuard-Config (.conf) kopieren und hier einfügen. Landet als
-            /etc/wireguard/proton.conf im Container (Rechte 600, wird validiert, Auto-Reconnect nach Reboot).
+            <code>/etc/wireguard/proton.conf</code> (Rechte 600, validiert, Auto-Reconnect nach Reboot).
           </p>
           {showSetup ? (
             <>
@@ -513,11 +634,12 @@ export default function App() {
             </>
           ) : (
             <button className="btn primary" onClick={() => setShowSetup(true)}>
-              {unconfigured ? '① WireGuard-Config einfügen' : 'Config ändern'}
+              {unconfigured ? '① Config einfügen' : 'Config ändern'}
             </button>
           )}
         </Card>
 
+        {/* ===== logs ===== */}
         <Card title="Logs & System" icon="🧾">
           <div className="btns">
             <button className="btn" disabled={busy !== null} onClick={loadLogs}>
@@ -525,7 +647,7 @@ export default function App() {
             </button>
             <button className="btn ghost" onClick={refresh}>Status aktualisieren</button>
           </div>
-          {showLogs && logs && <pre className="logs">{logs}</pre>}
+          {showLogs && logs && <pre className="logs term">{logs}</pre>}
         </Card>
       </div>
 
