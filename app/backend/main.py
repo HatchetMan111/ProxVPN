@@ -45,8 +45,9 @@ AUTH_FILE = Path(os.environ.get("PROXVPN_AUTH_FILE", "/etc/proxvpn/auth.json"))
 WEB_PORT = int(os.environ.get("PROXVPN_WEB_PORT", "8090"))
 TOKEN_TTL = 12 * 3600  # seconds a session token stays valid
 
-# Paths that stay reachable without a token (login must work to get one)
-_OPEN_PATHS = {"/api/health", "/api/login"}
+# API paths reachable without a token: liveness probe, pre-login auth probe,
+# and login itself (needed to obtain a token)
+_OPEN_PATHS = {"/api/health", "/api/auth", "/api/login"}
 
 
 def _run(cmd: list[str], timeout: int = 20) -> tuple[int, str, str]:
@@ -93,7 +94,10 @@ def _auth_enabled() -> bool:
 def _check_auth(request: Request) -> None:
     if not _auth_enabled():
         return
-    if request.url.path in _OPEN_PATHS:
+    path = request.url.path
+    if not path.startswith("/api/"):
+        return  # the SPA (/, /assets) stays public - otherwise no login screen
+    if path in _OPEN_PATHS:
         return
     header = request.headers.get("authorization", "")
     token = header[7:].strip() if header.lower().startswith("bearer ") else ""
@@ -341,7 +345,7 @@ def logs():
 def index():
     index_file = STATIC_DIR / "index.html"
     if index_file.exists():
-        return FileResponse(index_file)
+        return FileResponse(index_file, headers={"Cache-Control": "no-store"})
     return JSONResponse({"error": "frontend not built"}, status_code=500)
 
 

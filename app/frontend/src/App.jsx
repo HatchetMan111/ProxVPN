@@ -12,7 +12,8 @@ const api = (path, opts = {}) => {
     const body = await r.json().catch(() => ({}))
     if (r.status === 401) {
       localStorage.removeItem(TOKEN_KEY)
-      if (!path.startsWith('login')) window.location.reload()
+      // 'auth' is the pre-login probe - reloading on its 401 would loop forever
+      if (!path.startsWith('login') && !path.startsWith('auth')) window.location.reload()
     }
     if (!r.ok) throw { status: r.status, detail: body.detail, ...body }
     return body
