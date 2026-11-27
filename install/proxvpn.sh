@@ -11,22 +11,30 @@
 # Install (on the Proxmox host):
 #   bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/ProxVPN/main/install/proxvpn.sh)"
 #
+# Update an existing proxvpn container (keeps config, password, tunnel):
+#   UPDATE=1 bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/ProxVPN/main/install/proxvpn.sh)"
+#
 # Debug install (full trace):
 #   bash -x <(wget -qO- https://raw.githubusercontent.com/HatchetMan111/ProxVPN/main/install/proxvpn.sh)
 #
 # Optional env overrides:
 #   CT_ID=125 CORES=2 RAM=1024 DISK=4 BRIDGE=vmbr0 VLAN=10 bash -c "$(wget -qLO - ...)"
 #   REINSTALL=1 bash -c "$(wget -qLO - ...)"   # remove existing proxvpn CT and rebuild
+#   ALLOW_CIDR=192.168.1.0/24 bash -c ...      # only this subnet may use the gateway
+#   WEB_PASSWORD=mypass bash -c ...             # set the Web UI password explicitly
+#   NO_IPV6=1 bash -c ...                       # skip the IPv6 kill switch
 
 set -euo pipefail
 
 # ----------------------- VARIABLES -----------------------
 APP="proxvpn"
-APP_TITLE="ProxVPN Gateway"
 REPO_URL="https://github.com/HatchetMan111/ProxVPN"
 REPO_TARBALL="${REPO_URL}/archive/refs/heads/main.tar.gz"
-WEB_PORT="8090"
+WEB_PORT="${WEB_PORT:-8090}"
 WG_IF="proton"                 # wireguard interface name (matches /etc/wireguard/proton.conf)
+ALLOW_CIDR="${ALLOW_CIDR:-}"   # empty = any LAN client may use the gateway
+NO_IPV6="${NO_IPV6:-0}"        # 1 = do not install the IPv6 kill switch
+UPDATE="${UPDATE:-0}"          # 1 = update an existing proxvpn container in place
 
 CT_ID="${CT_ID:-auto}"         # next free ID if "auto"
 CT_NAME="${APP}"
@@ -80,6 +88,36 @@ for cmd in pct pvesh pveam wget; do
 done
 header_info
 
+# ----------------------- UPDATE MODE -----------------------
+if [[ "$UPDATE" == "1" ]]; then
+  EXISTING_CT_ID=$(pct list 2>/dev/null | awk -v name="$CT_NAME" 'NR>1 && $NF==name {print $1; exit}')
+  [[ -n "$EXISTING_CT_ID" ]] || { msg_error "UPDATE=1 but no container named '${CT_NAME}' exists."; exit 1; }
+  CT_ID="$EXISTING_CT_ID"
+  msg_info "UPDATE: refreshing ${APP} inside existing CT ${CT_ID} (config + password stay)"
+  pct exec "$CT_ID" -- bash -ec '
+    set -e
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    apt-get install -y -qq curl ca-certificates python3 python3-venv >/dev/null
+    mkdir -p /opt/proxvpn
+    wget -qO- "'"$REPO_TARBALL"'" | tar -xz -C /opt/proxvpn --strip-components=1
+    test -f /opt/proxvpn/app/backend/main.py
+    test -f /opt/proxvpn/app/backend/static/index.html || {
+      echo "ERROR: bundled frontend (app/backend/static) missing in tarball" >&2; exit 1; }
+    /opt/proxvpn/venv/bin/pip install --quiet -r /opt/proxvpn/app/backend/requirements.txt
+    systemctl restart proxvpn
+  '
+  sleep 3
+  if pct exec "$CT_ID" -- bash -ec "systemctl is-active proxvpn >/dev/null && curl -fsS -m 10 http://localhost:${WEB_PORT}/api/health >/dev/null"; then
+    CT_IP=$(pct exec "$CT_ID" -- hostname -I | awk '{print $1}')
+    msg_ok "Update complete: http://${CT_IP}:${WEB_PORT}"
+    exit 0
+  fi
+  msg_error "Update verification failed - service log:"
+  pct exec "$CT_ID" -- journalctl -u proxvpn --no-pager -n 60 || true
+  exit 1
+fi
+
 # ----------------------- CT-ID -----------------------
 if [[ "$CT_ID" == "auto" ]]; then
   CT_ID=$(pvesh get /cluster/nextid)
@@ -100,8 +138,9 @@ if [[ -n "$EXISTING_CT_ID" ]]; then
     msg_ok "Old container removed"
   else
     msg_error "A container named '${CT_NAME}' already exists (CT ${EXISTING_CT_ID})."
-    msg_info "Reuse it (see README 'Update') or rerun with REINSTALL=1 to remove and rebuild it:"
-    msg_info "  REINSTALL=1 bash -c \"\$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/ProxVPN/main/install/${APP}.sh)\""
+    msg_info "Update it in place (keeps config + password):"
+    msg_info "  UPDATE=1 bash -c \"\$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/ProxVPN/main/install/${APP}.sh)\""
+    msg_info "Or remove and rebuild: REINSTALL=1 ..."
     exit 1
   fi
 fi
@@ -148,7 +187,8 @@ NET_STRING="name=eth0,bridge=${BRIDGE},ip=dhcp"
 [[ -n "$VLAN" ]] && NET_STRING="${NET_STRING},tag=${VLAN}"
 # NOTE: 'STORAGE:SIZE' lets pct create a fresh volume (e.g. vm-<id>-disk-0).
 # 'STORAGE:rootfs,size=...' would reference a non-existent existing volume
-# on lvm/lvmthin storages ("no such logical volume pve/rootfs").
+# on lvm/lvmthin storages ("no such logical volume pve/rootfs"). The
+# 'rootdir' content type must be present, otherwise pct rejects the create.
 pct create "$CT_ID" "${TEMPLATE_STORAGE}:vztmpl/${TEMPLATE}" \
   --hostname "$CT_NAME" \
   --cores "$CORES" --memory "$RAM" --swap 512 \
@@ -170,12 +210,14 @@ sleep 2
 msg_ok "Container is up"
 
 # ----------------------- INSIDE CT: BASE PACKAGES -----------------------
+# NOTE: no nodejs/npm - the frontend is prebuilt and shipped in the repo.
+# Node in the CT caused CPU spikes on small hosts and is a needless attack surface.
 msg_info "Installing base packages inside CT (this can take a few minutes)"
 pct exec "$CT_ID" -- bash -ec '
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
   apt-get install -y -qq wireguard nftables python3 python3-venv python3-pip \
-    curl wget ca-certificates nodejs npm >/dev/null
+    curl wget ca-certificates >/dev/null
 '
 msg_ok "Base packages installed"
 
@@ -188,20 +230,12 @@ pct exec "$CT_ID" -- bash -ec '
     echo "ERROR: app sources incomplete, tarball download failed" >&2
     exit 1
   }
+  test -f /opt/proxvpn/app/backend/static/index.html || {
+    echo "ERROR: bundled frontend (app/backend/static/index.html) missing" >&2
+    exit 1
+  }
 '
-msg_ok "App sources in place (/opt/proxvpn)"
-
-msg_info "Building React/Vite frontend inside CT"
-pct exec "$CT_ID" -- bash -ec '
-  cd /opt/proxvpn/app/frontend
-  npm install --no-audit --no-fund >/dev/null 2>&1 || npm install --no-audit --no-fund
-  npm run build >/dev/null 2>&1 || npm run build
-  test -d dist || { echo "ERROR: vite build produced no dist/ directory" >&2; exit 1; }
-  mkdir -p /opt/proxvpn/app/backend/static
-  rm -rf /opt/proxvpn/app/backend/static/*
-  cp -r dist/* /opt/proxvpn/app/backend/static/
-'
-msg_ok "Frontend built into backend/static"
+msg_ok "App sources in place (/opt/proxvpn, frontend prebuilt)"
 
 msg_info "Setting up Python backend (venv + FastAPI)"
 pct exec "$CT_ID" -- bash -ec '
@@ -210,8 +244,26 @@ pct exec "$CT_ID" -- bash -ec '
 '
 msg_ok "Backend venv ready"
 
+# ----------------------- INSIDE CT: WEB UI PASSWORD -----------------------
+if [[ -n "${WEB_PASSWORD:-}" ]]; then
+  UI_PW="$WEB_PASSWORD"
+else
+  UI_PW=$(pct exec "$CT_ID" -- python3 -c 'import secrets; print(secrets.token_urlsafe(9))' | tr -d '\r\n')
+fi
+pct exec "$CT_ID" -- env PROXVPN_AUTH_FILE=/etc/proxvpn/auth.json python3 - "$UI_PW" <<'PY'
+import json, pathlib, sys
+pw = sys.argv[1]
+p = pathlib.Path("/etc/proxvpn/auth.json")
+p.parent.mkdir(parents=True, exist_ok=True)
+p.write_text(json.dumps({"password": pw, "tokens": {}}))
+p.chmod(0o600)
+PY
+msg_ok "Web UI password set (printed at the end of this install)"
+
 # ----------------------- INSIDE CT: KILL SWITCH -----------------------
-msg_info "Installing nftables kill switch (forward policy: drop unless via ${WG_IF})"
+msg_info "Installing nftables kill switch (forward: only via ${WG_IF}, input: web UI only)"
+FORWARD_SRC=""
+[[ -n "$ALLOW_CIDR" ]] && FORWARD_SRC="ip saddr ${ALLOW_CIDR}"
 pct exec "$CT_ID" -- bash -ec 'cat > /etc/nftables.conf <<EOF
 #!/usr/sbin/nft -f
 flush ruleset
@@ -224,7 +276,7 @@ table inet proxvpn {
   chain forward {
     type filter hook forward priority 0; policy drop;
     ct state established,related accept
-    iifname "eth0" oifname "'"$WG_IF"'" accept
+    iifname "eth0" oifname "'"$WG_IF"'" '"$FORWARD_SRC"' accept
     iifname "'"$WG_IF"'" oifname "eth0" accept
   }
   chain postrouting {
@@ -240,13 +292,33 @@ net.ipv4.ip_forward=1
 EOF
   sysctl -p /etc/sysctl.d/99-proxvpn.conf >/dev/null
 '
-msg_ok "Kill switch active: traffic only flows through ${WG_IF}"
+if [[ "$NO_IPV6" != "1" ]]; then
+  pct exec "$CT_ID" -- bash -ec 'cat > /etc/nftables-proxvpn-v6.conf <<EOF
+#!/usr/sbin/nft -f
+table inet proxvpn6 {
+  chain forward {
+    type filter hook forward priority 0; policy drop;
+  }
+  chain postrouting {
+    type nat hook postrouting priority 100;
+    oifname "'"$WG_IF"'" masquerade
+  }
+}
+EOF
+  nft -f /etc/nftables-proxvpn-v6.conf
+  printf "\ninclude /etc/nftables-proxvpn-v6.conf\n" >> /etc/nftables.conf
+  nft -f /etc/nftables.conf
+'
+  msg_ok "Kill switch active: IPv4 + IPv6 forwarding only through ${WG_IF}"
+else
+  msg_ok "Kill switch active: IPv4 forwarding only through ${WG_IF} (IPv6 skipped)"
+fi
 
 # ----------------------- INSIDE CT: SYSTEMD -----------------------
 msg_info "Installing systemd service (Restart=always, after network-online)"
 pct exec "$CT_ID" -- bash -ec 'cat > /etc/systemd/system/proxvpn.service <<EOF
 [Unit]
-Description=${APP_TITLE} Web UI
+Description=ProxVPN Gateway Web UI
 After=network-online.target
 Wants=network-online.target
 
@@ -272,7 +344,7 @@ sleep 3
 if ! pct exec "$CT_ID" -- bash -ec '
   set -x
   systemctl is-active proxvpn
-  curl -fsS -m 10 "http://localhost:'"$WEB_PORT"'" -o /dev/null
+  curl -fsS -m 10 "http://localhost:'"$WEB_PORT"'/api/health"
 ' >/dev/null 2>&1; then
   msg_error "Verification failed - full service log follows:"
   pct exec "$CT_ID" -- journalctl -u proxvpn --no-pager -n 60 || true
@@ -283,7 +355,10 @@ msg_ok "Service active, Web UI responds on port ${WEB_PORT}"
 CT_IP=$(pct exec "$CT_ID" -- hostname -I | awk '{print $1}')
 echo
 msg_ok "Install complete: http://${CT_IP}:${WEB_PORT}"
+echo -e "  ${GN}Web UI password:${CL} ${UI_PW}"
+echo -e "  ${YW}Login:${CL} http://${CT_IP}:${WEB_PORT}  (Passwort oben, oder in /etc/proxvpn/auth.json im CT)"
 msg_info "Next: paste your ProtonVPN WireGuard config in the Web UI (card 'Setup')."
 msg_info "The tunnel auto-reconnects after reboot (wg-quick@${WG_IF} is enabled on config save)."
 msg_info "Gateway use: point clients to ${CT_IP} as their default gateway (or add a static route on your router)."
+[[ -n "$ALLOW_CIDR" ]] && msg_info "Forwarding is restricted to ${ALLOW_CIDR} (ALLOW_CIDR)."
 echo

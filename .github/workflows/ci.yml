@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install backend deps
+        run: pip install -r app/backend/requirements.txt httpx
+      - name: Shell syntax + ShellCheck
+        run: |
+          bash -n install/proxvpn.sh
+          bash -n test/harness.sh
+          sudo apt-get install -y shellcheck
+          shellcheck -S warning install/proxvpn.sh
+      - name: Offline harness
+        run: bash test/harness.sh

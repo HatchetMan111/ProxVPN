@@ -4,30 +4,49 @@ Endpoints:
   GET  /api/status      tunnel up/down, kill switch, handshake, transfer
   POST /api/connect     wg-quick up proton (idempotent)
   POST /api/disconnect  wg-quick down proton (idempotent)
-  POST /api/test        connectivity test through the tunnel
+  POST /api/test        connectivity test through the tunnel (proxy proof)
   POST /api/config      save pasted ProtonVPN WireGuard config
   GET  /api/logs        last service log lines
   GET  /api/health      lightweight liveness probe
+  POST /api/login       exchange password for a session token
+  POST /api/logout      drop the current session token
 
 Everything runs locally; no cloud services required.
+
+Auth: when PROXVPN_AUTH_FILE (default /etc/proxvpn/auth.json) exists, every
+/api/* route except /api/health and /api/login requires a session token
+(Authorization: Bearer <token> or X-ProxVPN-Token). Without the file the UI
+stays open (the installer always writes the file and prints the password once).
 """
 from __future__ import annotations
 
+import hmac
+import json
+import os
 import re
+import secrets
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 app = FastAPI(title="ProxVPN Gateway", docs_url=None, redoc_url=None)
 
 WG_IF = "proton"  # matches /etc/wireguard/proton.conf
-WG_CONF = Path("/etc/wireguard/proton.conf")
+WG_CONF = Path(os.environ.get("PROXVPN_WG_CONF", "/etc/wireguard/proton.conf"))
 WG_QUICK = shutil.which("wg-quick") or "wg-quick"
 STATIC_DIR = Path(__file__).parent / "static"
+AUTH_FILE = Path(os.environ.get("PROXVPN_AUTH_FILE", "/etc/proxvpn/auth.json"))
+
+WEB_PORT = int(os.environ.get("PROXVPN_WEB_PORT", "8090"))
+TOKEN_TTL = 12 * 3600  # seconds a session token stays valid
+
+# Paths that stay reachable without a token (login must work to get one)
+_OPEN_PATHS = {"/api/health", "/api/login"}
 
 
 def _run(cmd: list[str], timeout: int = 20) -> tuple[int, str, str]:
@@ -52,9 +71,95 @@ def _full_chain(rc: int, out: str, err: str, cmd: list[str]) -> dict:
     }
 
 
+# --------------------------- auth ---------------------------
+def _load_auth() -> dict:
+    try:
+        return json.loads(AUTH_FILE.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def _tokens() -> dict:
+    """Valid, unexpired session tokens: {token: expiry}."""
+    now = time.time()
+    raw = _load_auth().get("tokens", {})
+    return {t: e for t, e in raw.items() if isinstance(e, (int, float)) and e > now}
+
+
+def _auth_enabled() -> bool:
+    return AUTH_FILE.exists()
+
+
+def _check_auth(request: Request) -> None:
+    if not _auth_enabled():
+        return
+    if request.url.path in _OPEN_PATHS:
+        return
+    header = request.headers.get("authorization", "")
+    token = header[7:].strip() if header.lower().startswith("bearer ") else ""
+    token = token or request.headers.get("x-proxvpn-token", "").strip()
+    if not token or token not in _tokens():
+        raise HTTPException(401, "Unauthorized. Login with the gateway password first.")
+
+
+@app.middleware("http")
+async def _auth_middleware(request: Request, call_next):
+    try:
+        _check_auth(request)
+    except HTTPException as e:
+        # FastAPI's HTTPException is not an ExceptionGroup, but the
+        # BaseHTTPMiddleware stack of some Starlette versions wraps it.
+        return JSONResponse(status_code=e.status_code, content={"detail": e.detail})
+    return await call_next(request)
+
+
+@app.post("/api/login")
+def login(body: dict):
+    if not _auth_enabled():
+        return {"ok": True, "token": None, "auth_enabled": False}
+    pw = str(body.get("password", ""))
+    expected = str(_load_auth().get("password", ""))
+    if not expected or not hmac.compare_digest(pw, expected):
+        raise HTTPException(401, "Wrong password.")
+    token = secrets.token_urlsafe(32)
+    auth = _load_auth()
+    auth.setdefault("tokens", {})[token] = time.time() + TOKEN_TTL
+    _save_auth(auth)
+    return {"ok": True, "token": token, "expires_in": TOKEN_TTL, "auth_enabled": True}
+
+
+def _save_auth(auth: dict) -> None:
+    AUTH_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = AUTH_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(auth))
+    tmp.chmod(0o600)
+    tmp.replace(AUTH_FILE)
+
+
+@app.post("/api/logout")
+def logout(request: Request):
+    header = request.headers.get("authorization", "")
+    token = header[7:].strip() if header.lower().startswith("bearer ") else ""
+    token = token or request.headers.get("x-proxvpn-token", "").strip()
+    if token:
+        auth = _load_auth()
+        auth.get("tokens", {}).pop(token, None)
+        _save_auth(auth)
+    return {"ok": True}
+
+
+@app.get("/api/auth")
+def auth_state():
+    """Whether a login is required (the UI calls this before anything else)."""
+    return {"auth_enabled": _auth_enabled()}
+
+
+# --------------------------- status helpers ---------------------------
 def _killswitch_active() -> bool:
     rc, out, _ = _run(["nft", "list", "chain", "inet", "proxvpn", "forward"])
-    return rc == 0 and "policy drop" in out and WG_IF in out
+    if rc != 0 or "policy drop" not in out:
+        return False
+    return WG_IF in out
 
 
 def _lan_ip() -> str | None:
@@ -71,15 +176,24 @@ def _wg_status() -> dict:
     endpoint = None
     handshake = None
     transfer = None
+    in_peer = False
     for line in show_out.splitlines():
-        if line.startswith("endpoint:"):
-            endpoint = line.split(":", 1)[1].strip()
-        elif line.startswith("latest handshake:"):
-            handshake = line.split(":", 1)[1].strip()
-        elif line.startswith("transfer:"):
-            transfer = line.split(":", 1)[1].strip()
+        stripped = line.strip()
+        if stripped.startswith("peer:"):
+            in_peer = True
+        # only trust the first peer block (wg show <if> may list several)
+        if in_peer and endpoint is None and stripped.startswith("endpoint:"):
+            endpoint = stripped.split(":", 1)[1].strip()
+        elif in_peer and handshake is None and stripped.startswith("latest handshake:"):
+            handshake = stripped.split(":", 1)[1].strip()
+        elif in_peer and transfer is None and stripped.startswith("transfer:"):
+            transfer = stripped.split(":", 1)[1].strip()
+    try:
+        configured = WG_CONF.exists()
+    except OSError:  # e.g. unreadable /etc/wireguard
+        configured = False
     return {
-        "configured": WG_CONF.exists(),
+        "configured": configured,
         "up": up,
         "endpoint": endpoint,
         "latest_handshake": handshake,
@@ -87,22 +201,16 @@ def _wg_status() -> dict:
         "killswitch_active": _killswitch_active(),
         "gateway_ip": _lan_ip(),
         "killswitch_iface": WG_IF,
+        "auth_enabled": _auth_enabled(),
         "detail": show_err if show_rc != 0 and "No such device" not in show_err else "",
     }
 
 
-def _public_ip(bind_iface: str | None = None) -> dict:
-    cmd = ["curl", "-fsS", "-m", "15", "https://api.ipify.org"]
-    if bind_iface:
-        cmd += ["--interface", bind_iface]
-    rc, out, err = _run(cmd, timeout=25)
-    return {"reachable": rc == 0, "ip": out if rc == 0 else None, "error": err or None}
-
-
+# --------------------------- routes ---------------------------
 @app.get("/api/status")
 def status():
     st = _wg_status()
-    st["web_port"] = 8090
+    st["web_port"] = WEB_PORT
     return st
 
 
@@ -113,7 +221,11 @@ def health():
 
 @app.post("/api/connect")
 def connect():
-    if not WG_CONF.exists():
+    try:
+        has_conf = WG_CONF.exists()
+    except OSError:
+        has_conf = False
+    if not has_conf:
         raise HTTPException(400, "No WireGuard config found. Use 'Setup' in the Web UI first.")
     if _wg_status()["up"]:
         return {"ok": True, "already_up": True, **_wg_status()}
@@ -148,18 +260,47 @@ def disconnect():
 
 @app.post("/api/test")
 def test():
-    """Test that traffic actually leaves through the tunnel.
+    """Prove that traffic really leaves through the tunnel.
 
-    When the tunnel is up, curl binds to the WireGuard interface, so a
-    positive result proves the path through the VPN. When it is down, the
-    kill switch already blocks forwarded traffic; we report that state.
+    Strategy (no external dependency on a single service):
+      1. Ask ipify through the tunnel interface (bound via --interface).
+      2. If that fails, ask ifconfig.me / icanhazip.com through the tunnel.
+      3. If the tunnel is down, report that honestly and show the direct IP
+         (which the kill switch does not block for the host itself).
+    The answer is trustworthy because curl is bound to the WireGuard
+    interface, so a success can only come through the tunnel.
     """
     st = _wg_status()
-    pub = _public_ip(bind_iface=WG_IF if st["up"] else None)
+    probes = []
+    if st["up"]:
+        for url in ("https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com"):
+            rc, out, err = _run(
+                ["curl", "-fsS", "-m", "8", "--interface", WG_IF, url], timeout=12
+            )
+            probes.append({"url": url, "ok": rc == 0, "ip": out if rc == 0 else None,
+                           "error": None if rc == 0 else (err or f"exit {rc}")})
+            if rc == 0:
+                break
+        via_tunnel = next((p["ip"] for p in probes if p["ok"]), None)
+    else:
+        via_tunnel = None
+    rc, direct, err = _run(["curl", "-fsS", "-m", "8", "https://api.ipify.org"], timeout=12)
     return {
         "tunnel_up": st["up"],
         "killswitch_active": st["killswitch_active"],
-        "public": pub,
+        "public": {
+            "reachable": bool(via_tunnel),
+            "ip": via_tunnel,
+            "via": "tunnel" if via_tunnel else None,
+            "probes": probes,
+            "direct_ip": direct if rc == 0 else None,
+            "direct_error": None if rc == 0 else (err or f"exit {rc}"),
+        },
+        "verdict": (
+            "traffic leaves through the tunnel"
+            if via_tunnel
+            else "no answer through the tunnel - tunnel down or peer unreachable"
+        ),
     }
 
 

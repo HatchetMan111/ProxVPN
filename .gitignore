@@ -1,12 +1,14 @@
 # Node / Vite
 node_modules/
-dist/
+app/frontend/dist/
 
 # Python
 __pycache__/
 *.pyc
 venv/
 
-# Built frontend inside backend (created at install time)
-app/backend/static/assets/
-app/backend/static/index.html
+# Built frontend inside backend is COMMITTED on purpose:
+# the LXC installer does not build (no Node in the container) but verifies
+# app/backend/static/index.html. Rebuild after frontend changes:
+#   cd app/frontend && npm ci && npm run build
+#   rm -rf ../backend/static && mkdir -p ../backend/static && cp -r dist/* ../backend/static/
