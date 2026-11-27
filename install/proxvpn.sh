@@ -115,10 +115,12 @@ msg_ok "Storages: templates=${TEMPLATE_STORAGE}, rootfs=${ROOTFS_STORAGE}"
 # ----------------------- TEMPLATE (pick latest debian-12 automatically) -----------------------
 msg_info "Selecting a Debian 12 template"
 pveam update >/dev/null 2>&1 || true
-TEMPLATE=$(pveam list "$TEMPLATE_STORAGE" 2>/dev/null | awk '{print $2}' | grep '^debian-12-standard' | sort -V | tail -n1)
+# NOTE: 'grep' returns exit code 1 when nothing matches, which is expected when
+# the template is not downloaded yet. '|| true' keeps pipefail from aborting.
+TEMPLATE=$(pveam list "$TEMPLATE_STORAGE" 2>/dev/null | awk '{print $2}' | grep '^debian-12-standard' | sort -V | tail -n1 || true)
 if [[ -z "$TEMPLATE" ]]; then
   # 'pveam available' output is single-column (" debian-12-standard_..."), so $1, not $2
-  TEMPLATE=$(pveam available 2>/dev/null | grep -o 'debian-12-standard[^ ]*' | sort -V | tail -n1)
+  TEMPLATE=$(pveam available 2>/dev/null | grep -o 'debian-12-standard[^ ]*' | sort -V | tail -n1 || true)
   if [[ -n "$TEMPLATE" ]]; then
     msg_info "Downloading template ${TEMPLATE}..."
     pveam download "$TEMPLATE_STORAGE" "$TEMPLATE" >/dev/null
