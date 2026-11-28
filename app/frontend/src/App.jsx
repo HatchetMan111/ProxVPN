@@ -527,7 +527,7 @@ export default function App() {
               />
               <h3 className="sec">DNS · AdGuard / Pi-hole</h3>
               <label className="field">
-                <span>DNS-IPs, kommagetrennt – Port 53 dorthin umgeht den Kill Switch immer</span>
+                <span>DNS-IPs, kommagetrennt – Port 53 dorthin umgeht den Kill Switch immer (Schritt-für-Schritt in der Anleitung unten)</span>
                 <input
                   type="text"
                   value={settings._dns || ''}
@@ -650,6 +650,114 @@ export default function App() {
           {showLogs && logs && <pre className="logs term">{logs}</pre>}
         </Card>
       </div>
+
+      {/* ===== embedded guide ===== */}
+      <Card title="Anleitung · Gateway, Clients & AdGuard/Pi-hole" icon="📖">
+        <details open>
+          <summary>🧭 Schnellstart (4 Schritte)</summary>
+          <ol className="steps">
+            <li>
+              <strong>WireGuard-Config von ProtonVPN holen:</strong> Auf
+              <code>account.protonvpn.com</code> → <em>Downloads</em> → <em>WireGuard configuration</em>.
+              Plattform „GNU/Linux“, Protokoll <strong>UDP 1194 oder 51820</strong> (nicht 443) –
+              dann den Inhalt der <code>.conf</code>-Datei kopieren.
+            </li>
+            <li>
+              <strong>Hier einfügen:</strong> Karte „WireGuard-Setup“ unten → Config einfügen →
+              „💾 Speichern“. Die Config landet als <code>/etc/wireguard/proton.conf</code> im
+              Container (Rechte 600, wird validiert).
+            </li>
+            <li>
+              <strong>Verbinden und prüfen:</strong> „▶ Verbinden“ oben → LED „Tunnel“ grün →
+              „🧪 Test“ drücken. Bei „Öffentliche IP“ muss jetzt eine <em>ProtonVPN</em>-IP stehen,
+              nicht deine Heim-IP.
+            </li>
+            <li>
+              <strong>Clients umstellen:</strong> Bei den Geräten, die über das VPN sollen, die
+              Gateway-IP aus der Kachel oben als <em>Standard-Gateway</em> eintragen (siehe
+              „Clients anbinden“).
+            </li>
+          </ol>
+        </details>
+
+        <details>
+          <summary>🏠 Clients anbinden (3 Varianten)</summary>
+          <ol className="steps">
+            <li>
+              <strong>Variante A – Router/DHCP (empfohlen):</strong> In den DHCP-Einstellungen
+              deines Routers <em>Standard-Gateway</em> auf die Gateway-IP des CT setzen. Alle
+              Geräte erben die Einstellung automatisch. Achtung: Damit geht dann das <strong>ganze
+              Netz</strong> über den Tunnel – der Kill Switch muss dafür aus sein, wenn der Tunnel
+              mal getrennt ist (oder du lässt ihn an und das Netz ist offline, bis der Tunnel
+              zurück ist).
+            </li>
+            <li>
+              <strong>Variante B – einzelnes Gerät:</strong> Nur ausgewählte Geräte umbiegen:<br />
+              • <em>Windows:</em> Netzwerkadapter → IPv4-Eigenschaften → Standardgateway eintragen<br />
+              • <em>Android/iOS:</em> WLAN → Netzwerk bearbeiten → IP-Einstellungen „statisch/manuell“ → Gateway eintragen
+            </li>
+            <li>
+              <strong>Variante C – zweites Subnetz (VLAN/LAN1):</strong> Auf dem Router eine
+              statische Route anlegen: Ziel-Subnetz → über die CT-IP. Am CT selbst ist nichts
+              einzustellen (er hat nur ein Interface und routed intern).
+            </li>
+          </ol>
+        </details>
+
+        <details>
+          <summary>🛡️ AdGuard / Pi-hole einbinden (5 Schritte)</summary>
+          <ol className="steps">
+            <li>
+              <strong>DNS-IP eintragen:</strong> Karte „Firewall & Einstellungen“ → Feld
+              „DNS-Server im LAN“ → IP deines AdGuard/Pi-hole (z. B. <code>192.168.1.111</code>).
+              Mehrere mit Komma trennen.
+            </li>
+            <li>
+              <strong>„💾 Anwenden“:</strong> Die Firewall wird neu gebaut und lässt Port 53 zu
+              diesen IPs <strong>immer</strong> durch den Kill Switch – auch bei getrenntem Tunnel.
+            </li>
+            <li>
+              <strong>„🔍 DNS-Test“:</strong> Jede Zeile muss ✅ „erreichbar“ zeigen. Bei ❌: läuft
+              der AdGuard/Pi-hole? Stimmt die IP? (Test prüft TCP 53 vom CT aus.)
+            </li>
+            <li>
+              <strong>Router-DHCP umstellen:</strong> Im Router als <em>DNS-Server</em> die
+              AdGuard/Pi-hole-IP eintragen (im selben DHCP-Dialog wie der Gateway-Eintrag aus
+              Schritt „Clients anbinden“). Die Clients fragen dann AdGuard <em>direkt</em> im LAN –
+              nicht durch den Tunnel, sonst würde der Filter umgangen/doppelt belastet.
+            </li>
+            <li>
+              <strong>Verifizieren:</strong> AdGuard-„Abfrageprotokoll“ zeigt jetzt die
+              DNS-Anfragen deiner Clients. Parallel zeigt „🧪 Test“ hier weiterhin die
+              Proton-IP: <strong>DNS = gefiltert im LAN, Traffic = verschlüsselt durch Proton.</strong>
+            </li>
+          </ol>
+        </details>
+
+        <details>
+          <summary>🔧 Fehlersuche</summary>
+          <ol className="steps">
+            <li>
+              <strong>Clients haben kein Internet, Tunnel getrennt:</strong> Das ist der Kill
+              Switch (by design). Entweder „▶ Verbinden“ oder in der Firewall-Karte den Kill
+              Switch ausschalten – dann geht Traffic ungeschützt direkt raus.
+            </li>
+            <li>
+              <strong>Handshake-Kachel sehr alt / Tunnel hängt:</strong> Der Watchdog startet den
+              Tunnel automatisch neu (wenn aktiv). Manuell: „■ Trennen“ → „▶ Verbinden“.
+            </li>
+            <li>
+              <strong>„Test“ zeigt die Heim-IP statt einer Proton-IP:</strong> Tunnel down oder
+              Proton-Config-Fehler → „Service-Log laden“ zeigt die komplette Fehlerkette.
+            </li>
+            <li>
+              <strong>Nichts geht mehr:</strong> Auf dem PVE-Host <code>UPDATE=1</code>-Einzeiler
+              (aus dem README) hält Config und Passwort. <code>REINSTALL=1</code> baut neu –
+              <strong>WireGuard-Config muss danach neu eingefügt werden!</strong>
+            </li>
+          </ol>
+        </details>
+      </Card>
 
       <footer className="foot">
         ProxVPN · Status aktualisiert alle 5 s · Web UI Port {status?.web_port ?? 8090}

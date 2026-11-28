@@ -60,6 +60,13 @@ CT_ID=125 ALLOW_CIDR=192.168.1.0/24 bash -c "$(wget -qLO - https://raw.githubuse
 Das **Web-UI-Passwort** wird am Ende der Installation ausgegeben (und steht in
 `/etc/proxvpn/auth.json` im Container, Rechte 600).
 
+## Anleitung in der Web-UI
+
+Die Oberfläche enthält unten eine eingebaute **„📖 Anleitung“-Karte** mit
+Schnellstart, Client-Anbindung (Router-DHCP / Einzelgerät / VLAN-Route),
+Schritt-für-Schritt-Einbindung von **AdGuard / Pi-hole** und Fehlersuche –
+die wichtigsten Schritte stehen also direkt dort, wo man sie braucht.
+
 ## Nach der Installation
 
 1. Web UI öffnen: `http://<LXC-IP>:8090` → mit dem Installations-Passwort anmelden

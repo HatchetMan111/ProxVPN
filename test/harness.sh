@@ -30,6 +30,8 @@ grep -q 'proxvpn-watchdog.timer' "$REPO/install/proxvpn.sh" && ok "watchdog time
 grep -q 'write_settings_file' "$REPO/install/proxvpn.sh" && ok "settings.json bootstrap present" || bad "settings.json bootstrap present"
 test -f "$REPO/app/backend/static/index.html" && ok "dist committed" || bad "dist committed"
 grep -q 'proxvpn_token' "$REPO/app/frontend/src/App.jsx" && ok "frontend login gate present" || bad "frontend login gate present"
+grep -q 'AdGuard / Pi-hole einbinden' "$REPO/app/frontend/src/App.jsx" && ok "embedded setup guide present" || bad "embedded setup guide present"
+grep -q 'Schnellstart' "$REPO/app/frontend/src/App.jsx" && ok "quick-start steps present" || bad "quick-start steps present"
 
 echo "== 3. Backend behaviour (mocked) =="
 TMP=$(mktemp -d)

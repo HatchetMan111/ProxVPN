@@ -344,6 +344,47 @@ pre.term { font-family: var(--mono); color: #9fe8c4; border-left: 3px solid var(
 /* ============ footer ============ */
 .foot { margin-top: 26px; text-align: center; color: var(--dim); font-size: 0.76rem; }
 
+/* ============ embedded guide ============ */
+details {
+  border: 1px solid var(--card-border);
+  border-radius: 10px;
+  margin-bottom: 8px;
+  background: rgba(7, 11, 22, 0.4);
+  overflow: hidden;
+}
+details[open] { border-color: rgba(110, 126, 210, 0.35); }
+details summary {
+  cursor: pointer; user-select: none;
+  padding: 11px 14px;
+  font-size: 0.88rem; font-weight: 600;
+  list-style: none;
+  display: flex; align-items: center; gap: 8px;
+  transition: background 0.15s;
+}
+details summary::-webkit-details-marker { display: none; }
+details summary::after {
+  content: '▸'; margin-left: auto; color: var(--dim);
+  transition: transform 0.2s;
+}
+details[open] summary::after { transform: rotate(90deg); }
+details summary:hover { background: rgba(38, 46, 80, 0.5); }
+.steps {
+  margin: 0; padding: 12px 14px 12px 38px;
+  display: flex; flex-direction: column; gap: 9px;
+}
+.steps li {
+  font-size: 0.85rem; line-height: 1.55; color: var(--text);
+  padding-left: 2px;
+}
+.steps li::marker {
+  color: var(--accent); font-weight: 700;
+  font-size: 0.8rem;
+}
+.steps code {
+  font-size: 0.82em;
+  background: rgba(7, 11, 22, 0.8);
+}
+
 @media (max-width: 640px) {
   .bar { position: static; }
   .hero-title { font-size: 1.2rem; }
